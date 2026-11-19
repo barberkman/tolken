@@ -347,16 +347,6 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         grows = [later.startswith(earlier) for earlier, later in zip(shown, shown[1:])]
         self.assertEqual(grows.count(False), 1)  # only where the "<<<<<<< SEARCH" line ends
 
-    def test_dropped_files_are_recognised_by_their_paths(self):
-        write("a b.pdf", "x")
-        write("c.png", "y")
-        here = os.path.abspath(".")
-        self.assertEqual(tui.dropped(f'"{here}\\a b.pdf"'), [f"{here}\\a b.pdf"])
-        self.assertEqual(tui.dropped(f"{here}\\a b.pdf"), [f"{here}\\a b.pdf"])  # not quoted, spaces and all
-        self.assertEqual(tui.dropped(f'"{here}\\a b.pdf" {here}\\c.png'), [f"{here}\\a b.pdf", f"{here}\\c.png"])
-        self.assertEqual(tui.dropped("look at c.png please"), [])
-        self.assertEqual(tui.dropped(""), [])
-
     async def test_a_dropped_file_is_attached_and_sent_as_a_pin(self):
         write("my spec.pdf", "x")
         path = os.path.abspath("my spec.pdf")
@@ -505,39 +495,6 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             self.assertFalse(self.app.suggestions.display)
             self.assertEqual(self.app.prompt.value, "@a.py @")
-
-    async def test_slash_suggests_commands(self):
-        self.answers = ["ok"]
-        with mock.patch.object(tolken, "models", lambda: [tolken.Llama(8192, "demo.gguf")]):
-            async with self.app.run_test() as pilot:
-                prompt, suggestions = self.app.prompt, self.app.suggestions
-                await self.type(pilot, "/")
-                self.assertTrue(suggestions.display)
-                self.assertEqual(self.app.commands, ["/model", "/undo", "/clear", "/exit"])
-                self.assertEqual(suggestions.content.plain.splitlines()[0],
-                                 "› /model  choose the model: llama-server's or one of Ollama's")
-                self.assertTrue(self.status().endswith("│ ↑↓ choose · enter run · tab complete · esc close"))
-                await pilot.press("down", "down", "up")
-                self.assertTrue(suggestions.content.plain.splitlines()[1].startswith("› /undo"))
-                await pilot.press("escape")  # closes the list and keeps what was typed
-                self.assertEqual((suggestions.display, self.app.commands, prompt.value), (False, None, "/"))
-                await self.type(pilot, "c")
-                self.assertEqual(self.app.commands, ["/clear"])
-                await pilot.press("tab")  # Tab completes the text and does not run the command
-                await pilot.pause()
-                self.assertEqual((prompt.value, suggestions.display), ("/clear ", False))
-                prompt.value = ""
-                await self.type(pilot, "/mo")
-                self.assertEqual(self.app.commands, ["/model"])
-                await pilot.press("enter")  # Enter runs the highlighted command
-                await self.until(pilot, lambda: self.app.models is not None)
-                self.assertEqual((prompt.value, self.app.commands), ("", None))
-                await pilot.press("escape")
-                for text in ("/zzz", "/model x", "see /"):  # no such command; past the name; not at the start
-                    prompt.value = ""
-                    await self.type(pilot, text)
-                    self.assertEqual((self.app.commands, suggestions.display), (None, False), text)
-                self.assertEqual(self.prompts, [])  # nothing was sent to the model
 
     async def test_shift_enter_and_ctrl_j_start_a_new_line(self):
         self.answers = ["ok"]

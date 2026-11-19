@@ -54,7 +54,7 @@ from textual.widgets import Markdown, Static, TextArea
 
 import tolken
 
-PLACEHOLDER = "Ask about this project · @file pins code · / for commands"
+PLACEHOLDER = "Do you remember the Shire, Mr. Frodo? · @file pins code · / for commands"
 COMMANDS = {  # what typing / offers, in this order
     "/model": "choose the model: llama-server's or one of Ollama's",
     "/undo": "put back the files that the last change of files changed",
