@@ -37,6 +37,8 @@ written with the defaults when it is missing. Keys left out keep their defaults:
   run             the commands the model may run: a command is allowed when its words
                   begin with those of an entry. In "auto" they run at once; any other
                   command, and every command in "ask", waits for the user
+  instructions    text added to the end of the system prompt, for every project:
+                  "Before ending with DONE, run RUN: build.cmd and fix what fails"
 
 Every prompt carries the project's file list. A pinned file also brings the
 project files it #includes, while they fit. Without a pin, the words of the
@@ -94,6 +96,7 @@ OPTIONS = {"temperature": 0.2}  # sent to the server as they are; a low temperat
 MAX_OUT = 2000          # tokens reserved for the answer, thinking included
 APPROVE = "ask"         # "ask": each change waits for the user; "auto": changes are made at once (anything else asks)
 RUN = ["python -m pytest", "python -m unittest"]  # commands allowed to run; arguments may follow
+INSTRUCTIONS = ""       # the user's own text, added to the end of the system prompt
 RUN_TIMEOUT = 120       # seconds a command may run before it is stopped
 RUN_CHARS = 3000        # characters of a command's output the model gets, per 8,192 tokens of window
 SEARCH_TOKENS = 4000    # at most this much automatically found code per question, however large the window
@@ -148,7 +151,12 @@ def running(allowed):
             "user may refuse it. Do not use shell syntax: no pipes, &, &&, ;, ^, %, or redirection.")
 
 
-RULES = f"{WRITING}\n\n{running(RUN)}"  # the system prompt; load_settings() names the allowed commands again
+def rules():
+    """The system prompt: the writing rules, the running rules naming the allowed commands, the user's instructions."""
+    return "\n\n".join(part for part in (WRITING, running(RUN), INSTRUCTIONS.strip()) if part)
+
+
+RULES = rules()  # the system prompt; load_settings() builds it again with the settings' commands and instructions
 
 NO_CODE = "(No file contents have been shown yet.)"  # stands where the code would be
 GO_ON = ("Continue the task. The latest copy of each file above, with the changed parts shown after it, "
@@ -1599,9 +1607,9 @@ def load_settings(path=SETTINGS):
 
     Exits with the error when the file is not valid JSON.
     """
-    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, RULES
+    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, INSTRUCTIONS, RULES
     defaults = {"servers": SERVERS, "model": MODEL, "context": CONTEXT, "think": THINK, "think_max": THINK_MAX,
-                "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN}
+                "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN, "instructions": INSTRUCTIONS}
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps(defaults, indent=2) + "\n")
@@ -1620,8 +1628,8 @@ def load_settings(path=SETTINGS):
     SERVERS = [url.rstrip("/") for url in ([servers] if isinstance(servers, str) else servers)]
     MODEL, CONTEXT, THINK, THINK_MAX = settings["model"], settings["context"], settings["think"], settings["think_max"]
     MAX_OUT, OPTIONS, APPROVE = settings["max_out"], settings["options"], settings["approve"]
-    RUN = settings["run"]
-    RULES = f"{WRITING}\n\n{running(RUN)}"  # so the model knows the commands allowed
+    RUN, INSTRUCTIONS = settings["run"], settings["instructions"]
+    RULES = rules()  # so the model knows the commands allowed and the user's instructions
 
 
 def startup():

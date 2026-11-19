@@ -1235,7 +1235,7 @@ class Settings(InTempDir):
     def setUp(self):
         super().setUp()
         for name in ("SERVERS", "MODEL", "CONTEXT", "THINK", "THINK_MAX", "MAX_OUT", "OPTIONS", "APPROVE", "RUN",
-                     "RULES"):
+                     "INSTRUCTIONS", "RULES"):
             patch = mock.patch.object(tolken, name, getattr(tolken, name))  # put back what load_settings changes
             patch.start()
             self.addCleanup(patch.stop)
@@ -1247,13 +1247,21 @@ class Settings(InTempDir):
                                             "model": "", "context": None, "think": False, "think_max": None,
                                             "max_out": 2000,
                                             "options": {"temperature": 0.2}, "approve": "ask",
-                                            "run": ["python -m pytest", "python -m unittest"]})
+                                            "run": ["python -m pytest", "python -m unittest"],
+                                            "instructions": ""})
         self.assertIn("[wrote the default settings to settings.json]", self.printed.getvalue())
+
+    def test_without_instructions_the_rules_end_with_the_running_part(self):
+        for settings in ({}, {"instructions": ""}, {"instructions": "  \n"}):
+            write("settings.json", json.dumps(settings))
+            tolken.load_settings("settings.json")
+            self.assertEqual(tolken.RULES, tolken.WRITING + "\n\n" + tolken.running(tolken.RUN))
 
     def test_the_file_replaces_the_defaults(self):
         write("settings.json", json.dumps({"servers": "http://192.168.1.50:11434/", "think": "high",
                                            "think_max": 4000, "context": 16384, "options": {"top_k": 20},
-                                           "tempreature": 1, "approve": "auto", "run": ["ctest --test-dir build"]}))
+                                           "tempreature": 1, "approve": "auto", "run": ["ctest --test-dir build"],
+                                           "instructions": "Run RUN: build.cmd before DONE.\n"}))
         tolken.load_settings("settings.json")
         self.assertEqual((tolken.SERVERS, tolken.MODEL, tolken.THINK, tolken.CONTEXT, tolken.MAX_OUT,
                           tolken.OPTIONS, tolken.APPROVE, tolken.RUN),
@@ -1262,6 +1270,7 @@ class Settings(InTempDir):
         self.assertEqual((tolken.THINK_MAX, tolken.Session().think_max), (4000, 4000))
         self.assertEqual(tolken.Session().approve, "auto")
         self.assertIn("These commands are allowed (arguments may follow them): ctest --test-dir build.", tolken.RULES)
+        self.assertTrue(tolken.RULES.endswith("redirection.\n\nRun RUN: build.cmd before DONE."))
         self.assertIn("unknown settings ignored: tempreature", self.printed.getvalue())
 
     def test_a_broken_file_exits_with_the_error(self):
