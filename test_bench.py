@@ -173,7 +173,8 @@ class Scripted:
 
     def chat(self, messages, ui=None, session=None):
         ui.timings({"predicted_n": 5, "predicted_ms": 250.0})
-        return self.answers.pop(0)
+        answer = self.answers.pop(0)
+        return answer + "DONE\n" if "REPLACE" in answer else answer  # as the rules ask, edits end with DONE
 
 
 GOOD = {  # for every task, answers that solve it

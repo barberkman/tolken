@@ -184,9 +184,14 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                          "First:\n\nthen\n" + self.BLOCK.format("`b.py`", "p", "q") + "Done.")
         self.assertEqual(tui.without_blocks(tui.without_blocks(answer, "a.py"), "b.py"), "First:\n\nthen\n\nDone.")
 
+    def test_without_blocks_removes_the_blocks_that_follow_a_files_block(self):
+        more = "<<<<<<< SEARCH\np\n=======\nq\n>>>>>>> REPLACE\n"
+        answer = "First:\n" + self.BLOCK.format("a.py", "x", "y") + more + "Done."
+        self.assertEqual(tui.without_blocks(answer, "a.py"), "First:\n\nDone.")
+
     async def run_edit(self, key):
         write("a.txt", "one\ntwo\n")
-        self.answers = ["Change it:\n\n```\n" + self.BLOCK.format("a.txt", "two", "2") + "```\n"]
+        self.answers = ["Change it:\n\n```\n" + self.BLOCK.format("a.txt", "two", "2") + "```\n", "DONE"]
         async with self.app.run_test() as pilot:
             prompt = self.app.prompt
             await self.submit(pilot, "zzz change two")
@@ -247,7 +252,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
     async def test_in_auto_mode_changes_are_shown_and_made_without_a_key(self):
         write("a.txt", "one\n")
         write("b.txt", "two\n")
-        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "DELETE: b.txt\n"]
+        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "DELETE: b.txt\n", "DONE"]
         async with self.app.run_test() as pilot:
             await pilot.press("shift+tab")
             await self.submit(pilot, "zzz change it")
@@ -261,7 +266,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
     async def test_shift_tab_applies_the_waiting_change_and_makes_the_rest_at_once(self):
         write("a.txt", "one\n")
         write("b.txt", "two\n")
-        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "\n" + self.BLOCK.format("b.txt", "two", "2")]
+        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "\n" + self.BLOCK.format("b.txt", "two", "2"), "DONE"]
         async with self.app.run_test() as pilot:
             await self.submit(pilot, "zzz change both")
             await self.until(pilot, lambda: self.app.asking)
@@ -386,7 +391,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(key=key):
                 write("a.txt", "one\ntwo\n")
                 self.app = tui.TolkenApp(8192, "demo.gguf")
-                self.answers = ["It is not needed.\nDELETE: a.txt\n"]
+                self.answers = ["It is not needed.\nDELETE: a.txt\n", "DONE"]
                 async with self.app.run_test() as pilot:
                     await self.submit(pilot, "zzz remove a.txt")
                     await self.until(pilot, lambda: self.app.asking)
@@ -753,7 +758,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_undo_puts_back_the_last_changes(self):
         write("a.txt", "one\n")
-        self.answers = [self.BLOCK.format("a.txt", "one", "1")]
+        self.answers = [self.BLOCK.format("a.txt", "one", "1"), "DONE"]
         async with self.app.run_test() as pilot:
             await pilot.press("shift+tab")
             await self.submit(pilot, "zzz change it")

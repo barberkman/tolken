@@ -204,6 +204,15 @@ class Edits(InTempDir):
             ("src/a.py", "x = 1", ""),
             ("new.txt", "", "hello")])
 
+    def test_blocks_without_a_path_line_are_for_the_file_before(self):
+        block = "<<<<<<< SEARCH\n{0}\n=======\n{1}\n>>>>>>> REPLACE\n"
+        answer = ("FILE: a.py\n" + block.format("one", "1") + block.format("two", "2")
+                  + "FILE: b.py\n```python\n" + block.format("x", "y") + "```\n```python\n" + block.format("p", "q")
+                  + "```\n")
+        self.assertEqual(tolken.parse_edits(answer), [("a.py", "one", "1"), ("a.py", "two", "2"),
+                                                      ("b.py", "x", "y"), ("b.py", "p", "q")])
+        self.assertEqual(tolken.parse_edits(block.format("one", "1")), [("", "one", "1")])  # no file named at all
+
     def test_block_path_drops_labels_and_marks(self):
         for line in ("src/a.py", "FILE: src/a.py", "**File path:** `src/a.py`", "FILE_PATH: src\\a.py",
                      "### path = src/a.py", "`src/a.py`:"):
@@ -414,7 +423,7 @@ class Undo(InTempDir):
         write("gone.txt", "bye\n")
         session = self.session("FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n"
                                "FILE: new/deep/b.txt\n<<<<<<< SEARCH\n=======\nfresh\n>>>>>>> REPLACE\n"
-                               "DELETE: gone.txt\n", "ok")
+                               "DELETE: gone.txt\nDONE\n", "ok")
         session.send("zzz change")
         self.assertEqual((read_bytes("a.txt"), os.path.exists("gone.txt")), (b"1\r\n", False))
         session.send("zzz a question that changes nothing")  # undo still covers the message before
@@ -427,7 +436,7 @@ class Undo(InTempDir):
 
     def test_undo_keeps_a_file_changed_since(self):
         write("a.txt", "one\n")
-        session = self.session("FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n")
+        session = self.session("FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\nDONE\n")
         session.send("zzz change")
         write("a.txt", "mine\n")
         self.assertEqual(session.undo(), ["kept a.txt: it has changed since"])
@@ -435,7 +444,7 @@ class Undo(InTempDir):
 
     def test_clear_forgets_what_undo_would_put_back(self):
         write("a.txt", "one\n")
-        session = self.session("FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n")
+        session = self.session("FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\nDONE\n")
         session.send("zzz change")
         session.clear()
         self.assertEqual(session.undo(), ["nothing to undo"])
@@ -816,7 +825,7 @@ class Rounds(InTempDir):
     def test_a_file_edited_at_the_end_of_a_message_is_shown_whole_with_the_next(self):
         write("a.py", "def price():\n    return 1\n")
         edit = self.EDIT.format("a.py", "    return 1", "    tax = 2\n    return 1 + tax")
-        self.run_main([edit, "ok"], inputs=["zzz what is the price", "y", "zzz again"])
+        self.run_main([edit + "DONE", "ok"], inputs=["zzz what is the price", "y", "zzz again"])
         self.assertIn("--- a.py (lines 1-3 of 3) ---\ndef price():\n    tax = 2\n    return 1 + tax", self.sent[1])
 
     def test_a_small_file_that_changed_is_shown_whole(self):
@@ -832,10 +841,54 @@ class Rounds(InTempDir):
         self.assertEqual(len(calls), 2)
         self.assertIn("body of b", calls[1])
 
-    def test_edits_without_continue_end_the_message(self):
+    def test_edits_ending_with_done_end_the_message(self):
+        for done in ("DONE", "**DONE**"):
+            write("a.py", "old a\n")
+            calls = self.run_main([self.EDIT.format("a.py", "old a", "new a") + done, "never"], replies=["y"])
+            self.assertEqual(len(calls), 1, done)
+            self.assertEqual(read_bytes("a.py"), b"new a\n")
+
+    def test_edits_without_done_get_one_more_call(self):
         write("a.py", "old a\n")
-        self.assertEqual(len(self.run_main([self.EDIT.format("a.py", "old a", "new a"), "never"], replies=["y"])), 1)
-        self.assertEqual(read_bytes("a.py"), b"new a\n")
+        calls = self.run_main([self.EDIT.format("a.py", "old a", "new a") + "Next I will look at b.py.", "Done.",
+                               "never"], replies=["y"])
+        self.assertEqual(len(calls), 2)  # "Done." changes nothing, so the message ends
+        self.assertEqual(self.sent[1], "--- a.py (lines 1-1 of 1) ---\nnew a\n\napplied a.py\n" + tolken.GO_ON)
+
+    def test_continue_is_read_with_markdown_and_in_any_case(self):
+        for line in ("**CONTINUE**", "Continue.", "`CONTINUE`"):
+            self.assertEqual(len(self.run_main(["Plan first.\n" + line, "Planned.", "never"])), 2, line)
+
+    def test_the_model_is_told_what_it_changed_earlier_in_the_task(self):
+        for name in ("a.py", "b.py", "c.py"):
+            write(name, f"old {name}\n")
+        self.run_main([self.EDIT.format(name, f"old {name}", f"new {name}") for name in ("a.py", "b.py", "c.py")]
+                      + ["DONE", "never"], replies=["y"] * 3)
+        self.assertNotIn("Changed earlier", self.sent[1])
+        self.assertTrue(self.sent[2].endswith("applied b.py\nChanged earlier in this task: a.py.\n" + tolken.GO_ON))
+        self.assertTrue(self.sent[3].endswith("applied c.py\nChanged earlier in this task: a.py, b.py.\n"
+                                              + tolken.GO_ON))
+
+    def test_a_full_window_drops_the_files_already_changed_first_and_does_not_stop_the_work(self):
+        for i in range(1, 5):  # about 7,800 characters each: the four do not fit an 8,192-token window together
+            write(f"m{i}.py", "".join(f"def helper_{n}(x):\n    return x + {n}  # uses LIMIT_VALUE here, case {n}\n\n"
+                                      for n in range(110)))
+        answers = [self.EDIT.format(f"m{i}.py", "def helper_0(x):", "def helper_zero(x):") for i in range(1, 5)]
+        calls = self.run_main(answers + ["DONE", "never"],
+                              inputs=["zzz rename helper_0 where LIMIT_VALUE is used", "y", "y", "y", "y"])
+        self.assertEqual(len(calls), 5)
+        for i in range(1, 5):
+            self.assertIn(f"--- m{i}.py (", calls[i - 1])  # the file to change next is still shown
+            self.assertIn(b"def helper_zero(x):", read_bytes(f"m{i}.py"))
+        self.assertTrue(any(prompt[1]["content"].startswith("--- m") and "--- m1.py" not in prompt[1]["content"]
+                            for prompt in self.prompts))  # a prompt built afresh left out the first file changed
+
+    def test_markers_inside_an_edit_are_code(self):
+        write("a.py", "for x in y:\n    pass\n")
+        edit = self.EDIT.format("a.py", "    pass", "    continue\nDONE = 1")
+        self.assertEqual(len(self.run_main([edit + "DONE", "never"], replies=["y"])), 1)  # no CONTINUE
+        write("a.py", "for x in y:\n    pass\n")
+        self.assertEqual(len(self.run_main([edit, "Planned.", "never"], replies=["y"])), 2)  # no DONE
 
     def test_declining_an_edit_ends_the_message(self):
         write("a.py", "old a\n")
@@ -862,7 +915,7 @@ class Rounds(InTempDir):
 
     def test_a_message_whose_edits_all_landed_tells_nothing_more(self):
         write("a.py", "old a\n")
-        self.run_main([self.EDIT.format("a.py", "old a", "new a"), "ok"], inputs=["zzz one", "y", "zzz two"])
+        self.run_main([self.EDIT.format("a.py", "old a", "new a") + "DONE", "ok"], inputs=["zzz one", "y", "zzz two"])
         self.assertEqual(self.sent[1], "zzz two")
 
     def test_a_failed_edit_is_retried_once(self):
@@ -921,7 +974,7 @@ class Rounds(InTempDir):
 
     def test_a_file_the_model_creates_is_not_reported_again(self):
         create = "FILE: new.py\n<<<<<<< SEARCH\n=======\nfresh\n>>>>>>> REPLACE\n"
-        self.run_main([create, "ok"], inputs=["zzz one", "y", "zzz two"])
+        self.run_main([create + "DONE\n", "ok"], inputs=["zzz one", "y", "zzz two"])
         self.assertEqual(self.sent[1], "zzz two")
 
 
@@ -1011,20 +1064,36 @@ class Models(InTempDir):
         self.assertIn(("warn", "the answer reached max_out (2,000 tokens) while the model was thinking; "
                                "asking again without thinking"), self.notes)
 
-    def test_an_answer_cut_off_without_thinking_is_kept_with_a_warning(self):
-        asked = []
+    def test_an_answer_cut_off_without_thinking_is_kept_with_a_warning_and_continued(self):
+        asked, sent = [], []
 
         class Talker(FakeModel):
             def chat(self, messages, ui=None, session=None, think=None):
                 asked.append(think)
-                session.cut = True
-                return "a long answer"
+                sent.append(messages[-1]["content"])
+                session.cut = len(asked) == 1
+                return "a long answer" if len(asked) == 1 else "the rest"
 
         session = tolken.Session(self.ui)
         session.use(Talker("one", 65536))
         session.send("zzz")
-        self.assertEqual((asked, session.history), ([None], [("zzz", "a long answer")]))
+        self.assertEqual((asked, session.history), ([None, None], [("zzz", "the rest")]))
         self.assertIn(("warn", "the answer reached max_out (2,000 tokens) and was cut off"), self.notes)
+        self.assertTrue(sent[1].startswith("your answer was cut off at the length limit (2,000 tokens);"))
+
+    def test_a_model_that_keeps_editing_stops_after_max_calls(self):
+        write("a.txt", "x\n")
+        flip = ["FILE: a.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n",
+                "FILE: a.txt\n<<<<<<< SEARCH\ny\n=======\nx\n>>>>>>> REPLACE\n"]
+        answers, model = flip * 5, FakeModel("one")
+        model.chat = lambda *_, **__: answers.pop(0)
+        session = tolken.Session(self.ui)
+        session.use(model)
+        session.approve = "auto"
+        with mock.patch.object(tolken, "MAX_CALLS", 3):
+            session.send("zzz change it")
+        self.assertEqual(len(answers), 10 - 3)
+        self.assertIn(("info", "stopped after 3 calls; reply to let the model go on"), self.notes)
 
     def test_thinking_past_think_max_ends_the_stream(self):
         class Response:

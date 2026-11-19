@@ -54,11 +54,13 @@ is built afresh: the file list, the loaded code, the newest exchanges and the
 question. The file list and those exchanges grow with the window.
 
 Edits are applied as each answer arrives, once the user confirms them. The
-model is then called again when it ends with a CONTINUE line, asks for files,
-or an edit could not be applied; it is told how its edits went. It stops when
-the user declines an edit, or when two answers in a row change nothing. What
-the model was not told then (an edit declined or undone, one that failed, a
-command's output) comes before the next message.
+model is then called again, and told how its edits went, unless it ended the
+answer with a DONE line; it is also called again when it ends with a CONTINUE
+line, asks for files, an edit could not be applied, or its answer was cut off
+at max_out. It stops when the user declines an edit, when two answers in a row
+change nothing, when the window is full and an answer changes nothing, or after
+MAX_CALLS calls. What the model was not told then (an edit declined or undone,
+one that failed, a command's output) comes before the next message.
 
 The model runs a command (to build or test) with a "RUN: command" line, after
 its edits are made. It runs without a shell (shell syntax is refused, since a
@@ -104,6 +106,7 @@ MAX_FILE = 1_000_000    # bytes; larger files are not searched
 COMMON = 200            # a word found on more lines than this is ignored
 MAX_ANSWER = 3000       # characters of earlier exchanges carried into a prompt built afresh, per 8,192 tokens of window
 MAP_CHARS = 1500        # characters of the file list, per 8,192 tokens of window
+MAX_CALLS = 20          # model calls per message at most, so a model that keeps editing cannot go on forever
 SKIP_DIRS = {"node_modules", "build", "dist", "out", "target", "bin", "obj",
              "__pycache__", "venv"}  # hidden directories are skipped as well
 STOPWORDS = set("""
@@ -134,7 +137,7 @@ new lines
 To create a new file, leave SEARCH empty; put it directly in the project folder unless the user names a place.
 To delete or remove a file, do not use a block; write this line for it:
 DELETE: {EXAMPLE_PATH}
-If the task needs more steps after these changes, end the answer with a line saying only CONTINUE: once the changes are applied you will be told how they went and can go on."""
+Your changes are applied as you give them, and you are then told how they went, so you can make them a file or two at a time. When the task is finished, end the answer with a line saying only DONE. To go on without changing files now (after making a plan, say), end it with a line saying only CONTINUE."""
 
 
 def running(allowed):
@@ -149,14 +152,18 @@ RULES = f"{WRITING}\n\n{running(RUN)}"  # the system prompt; load_settings() nam
 
 NO_CODE = "(No file contents have been shown yet.)"  # stands where the code would be
 GO_ON = ("Continue the task. The latest copy of each file above, with the changed parts shown after it, "
-         "is as it is now.")  # follows the results of the model's edits
+         "is as it is now. If the task is finished, reply with only DONE.")  # follows the results of the model's edits
 
-BLOCK = re.compile(
-    r"^([^\n]+)\n+(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n(.*?)^={5,9}[ \t]*\n(.*?)^>{5,9} REPLACE",
+BLOCK = re.compile(  # the path line is left out when a block follows another one for the same file
+    r"^(?:([^\n]+)\n+)?(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n(.*?)^={5,9}[ \t]*\n(.*?)^>{5,9} REPLACE",
     re.S | re.M)
 LABEL = re.compile(r"^(?:file(?:[ _]?(?:path|name))?|path)\s*[:=]\s*", re.I)  # "FILE:" before a block's path
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
-CONTINUE = re.compile(r"^CONTINUE\b", re.M)  # the model has more to do after its edits
+# The model has more to do; markdown and case are allowed, since a missed one ends the task too early.
+# Both are looked for outside the edit blocks, and not indented, as a line of code would be.
+CONTINUE = re.compile(r"^[>*_`#-]*CONTINUE\b", re.M | re.I)
+# The task is finished; in capitals only, so that "Done with a.py, now b.py" does not end it.
+DONE = re.compile(r"^[>*_`#-]*DONE\b", re.M)
 RUN_LINE = re.compile(r"^RUN:(.*)$", re.M)  # a command the model wants to run
 SHELL = re.compile(r"\|\||&&|[|;<>`&^%]")  # what only a shell understands; a .cmd or .bat file runs in cmd.exe
 
@@ -930,10 +937,23 @@ def block_path(line):
     return "" if not path or "<" in path or ">" in path else local(norm(path))
 
 
+def edit_blocks(answer):
+    """[(match, path)] for each SEARCH/REPLACE block in an answer.
+
+    A block with no path line above it, or only a code fence, is for the file of the block before.
+    """
+    found, path = [], ""
+    for block in BLOCK.finditer(answer):
+        line = block[1]
+        if line is not None and line.strip(" `~"):
+            path = block_path(line)
+        found.append((block, path))
+    return found
+
+
 def parse_edits(answer):
     """[(path, search, replace)] for each SEARCH/REPLACE block in an answer."""
-    return [(block_path(line), old.removesuffix("\n"), new.removesuffix("\n"))
-            for line, old, new in BLOCK.findall(answer)]
+    return [(path, block[2].removesuffix("\n"), block[3].removesuffix("\n")) for block, path in edit_blocks(answer)]
 
 
 def places(lines, old_lines, key):
@@ -1203,6 +1223,7 @@ class Session:
         # the server reads only what is new; logged: the code in it, as shown; listed: its file list.
         self.log, self.logged, self.listed = [], {}, set()
         self.untold = []  # what happened after an answer that the model has not been told yet
+        self.finished = []  # the files whose last edits all applied, in the order they were made; see apply()
         # For /undo: path -> [bytes before (None: it was created), bytes after (None: deleted), folders created],
         # for the last message that changed files; fresh: the running message has changed none yet.
         self.saved, self.fresh = {}, True
@@ -1295,10 +1316,11 @@ class Session:
     def send(self, question):
         """Answer one message: build the prompt, call the model, load the files it asks for, apply its edits.
 
-        The model is called again while it asks for files that are not shown, ends
-        with CONTINUE after its edits, or an edit could not be applied. It stops
-        when the user declines an edit, the window is full, or two answers in a
-        row neither changed a file nor brought in a new one.
+        The model is called again while it asks for files that are not shown, made
+        changes without ending with DONE, ends with CONTINUE, an edit could not be
+        applied, or its answer was cut off. It stops when the user declines an
+        edit, the window is full and an answer changed nothing, two answers in a
+        row neither changed a file nor brought in a new one, or after MAX_CALLS calls.
 
         Each call continues the conversation of the call before while it fits the
         window (see compose()); the budgets below are for a prompt built afresh.
@@ -1346,6 +1368,7 @@ class Session:
         if not self.ctx:
             self.ctx = search(question, min(budget, SEARCH_TOKENS * 3), files)
         answer, full, idle = "", False, 0  # full: no room is left for more files; idle: answers in a row that did nothing
+        more, progress = None, {}  # whether the model has more to do; the files this message changed so far
         for call in itertools.count(1):
             try:
                 pinned = [entry for entry in self.ctx if entry in self.pins]
@@ -1391,6 +1414,10 @@ class Session:
             if self.stopped:
                 break
             changed, problems, declined = self.apply(answer)
+            if self.cut:  # the model is called again for the rest
+                problems.append(f"your answer was cut off at the length limit ({answer_room(size):,} tokens); the "
+                                "complete edit blocks in it were handled. Give the rest in the next answer, a file "
+                                "or two at a time.")
             ran, refused = ([], []) if declined else self.run(answer)  # after the edits, which it may test
             declined += refused
             report = [f"{done} {path}" for path, done in changed.items()] + problems + ran + declined
@@ -1404,20 +1431,27 @@ class Session:
             if changed:
                 files = readable_files()  # with the files it created or deleted
             wanted = self.visible([entry for entry in requested(answer, files) if entry not in self.ctx])
-            more = CONTINUE.search(answer)
+            prose = BLOCK.sub("", answer)  # so that code in an edit, such as a continue statement, is no marker
+            more = CONTINUE.search(prose) or bool(changed) and not DONE.search(prose)
             idle = 0 if changed or wanted else idle + 1
-            if declined or full or shown != before or idle == 2 or not (wanted or more or problems or ran):
-                break  # the user stepped in, the window is full, nothing is happening, or the model is done
+            crowded = full or shown != before  # the window is full: going on is worth it only while files change
+            if declined or crowded and not changed or idle == 2 or call == MAX_CALLS \
+                    or not (wanted or more or problems or ran):
+                break  # the user stepped in, nothing is happening, it has gone on long enough, or the model is done
             if changed or problems or more or ran:
                 # Tell the model how its edits and commands went, and show it the files it changed or tried to.
                 record(answer)
-                prompt = "\n".join(report + [GO_ON])
+                earlier = [path for path in progress if path not in changed]
+                prompt = "\n".join(report + [f"Changed earlier in this task: {', '.join(earlier)}."] * bool(earlier)
+                                   + [GO_ON])
+                progress.update(changed)
                 budget = room()
                 named = dict.fromkeys([*changed, *(path for path, _, _ in parse_edits(answer) if path)])
                 wanted += [[path, 1, None] for path in named if os.path.isfile(path)
                            and not any(entry[0] == path for entry in self.ctx + wanted)]
             if wanted and chars(self.ctx) + chars(wanted) > budget:
-                # No room for all of it: cut the requested files to fit, drop older code, ask one last time.
+                # No room for all of it: cut the requested files to fit and drop older code. From now on
+                # an answer that changes nothing ends the message.
                 ranges = [entry for entry in wanted if entry[2]]
                 wanted = heads([entry[0] for entry in wanted if not entry[2]][::-1],
                                budget - chars(ranges)) + ranges
@@ -1435,18 +1469,23 @@ class Session:
         if re.search(r"^NEED:", answer, re.M):
             ui.note("the model still wants files; pin the part it needs with @file:START-END, "
                     "or reply to let it try again")
-        elif CONTINUE.search(answer):
-            ui.note("the model wanted to go on; reply to let it continue")
+        elif more:
+            ui.note(f"stopped after {MAX_CALLS} calls; reply to let the model go on" if call == MAX_CALLS
+                    else "the model wanted to go on; reply to let it continue")
 
     def widen(self, paths):
-        """Show the files at paths, just edited, whole from now on: a line range of one was for its old lines."""
+        """Show the files at paths, just edited, whole from now on: a line range of one was for its old lines.
+
+        The whole file takes the place of its first range, keeping the order of the entries.
+        """
         for path in paths:
             for entries in (self.ctx, self.pins):
                 ranged = [entry for entry in entries if entry[0] == path and entry[1:] != [1, None]]
                 if ranged:
+                    at = entries.index(ranged[0])  # the entries before it are not ranges of the file
                     entries[:] = [entry for entry in entries if entry not in ranged]
                     if [path, 1, None] not in entries:
-                        entries.append([path, 1, None])
+                        entries.insert(at, [path, 1, None])
 
     def visible(self, entries):
         """entries without the images, with a warning for each, when the model in use cannot see."""
@@ -1500,6 +1539,7 @@ class Session:
         not be done; declined are the notes about what the user said no to.
         """
         ui, changed, problems, declined = self.ui, {}, [], []
+        finished = []  # the files whose edits in this answer all applied
 
         def problem(text):
             ui.note(text, "bad")
@@ -1529,6 +1569,8 @@ class Session:
                 if done:
                     changed[path] = "applied"
                     self.remember(path, *before)
+                    if not said:
+                        finished.append(path)
         for path in dict.fromkeys(removals):
             before = raw_bytes(path) if os.path.isfile(path) else None
             done, said = delete_file(path, ui, self.approve == "auto")
@@ -1538,8 +1580,14 @@ class Session:
             if done:
                 changed[path] = "deleted"
                 self.remember(path, before, [])
-        # A deleted file can no longer be shown.
-        self.ctx = [entry for entry in self.ctx if os.path.isfile(entry[0])]
+        # A deleted file can no longer be shown. The files whose edits all applied go first, in the order
+        # they were finished, so that they are dropped first when the window is full: the files still to
+        # be changed are worth more. A file this answer tried to edit is not finished unless it was again.
+        self.finished = [path for path in self.finished if path not in edits] + finished
+        order = {path: number for number, path in enumerate(self.finished)}
+        kept = [entry for entry in self.ctx if os.path.isfile(entry[0])]
+        self.ctx = (sorted((entry for entry in kept if entry[0] in order), key=lambda entry: order[entry[0]])
+                    + [entry for entry in kept if entry[0] not in order])
         self.pins = [entry for entry in self.pins if os.path.isfile(entry[0])]
         return changed, problems, declined
 

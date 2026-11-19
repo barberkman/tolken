@@ -291,15 +291,15 @@ def diff_card(path, old, new):
 
 def without_blocks(text, path):
     """text without the SEARCH/REPLACE blocks for path (and the code fence around each)."""
-    for block in reversed(list(tolken.BLOCK.finditer(text))):
-        if tolken.block_path(block[1]) == path:
+    for block, owner in reversed(tolken.edit_blocks(text)):
+        if owner == path:
             head = re.sub(r"(^|\n)```[^\n]*\n\Z", r"\1", text[:block.start()])
             tail = re.sub(r"\A\n```[ \t]*(?=\n|\Z)", "", text[block.end():])
             text = head + tail
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-PROTOCOL = re.compile(r"^(?:NEED:|RUN:|DELETE:|FILE:|CONTINUE\b)")  # tolken's lines in an answer
+PROTOCOL = re.compile(r"^(?:NEED:|RUN:|DELETE:|FILE:|CONTINUE\b|DONE\b)")  # tolken's lines in an answer
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
