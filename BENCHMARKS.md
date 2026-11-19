@@ -1,6 +1,6 @@
 # Benchmarks
 
-How well each model does small coding tasks through this harness, compared with Claude Opus working as Claude Code. Measured on 2026-11-17 with `bench.py`.
+How well each model does small coding tasks through tolken, compared with Claude Opus working as Claude Code. Measured on 2026-11-17 with `bench.py`.
 
 ## Result
 
@@ -11,7 +11,7 @@ The harder task set: 11 tasks, 3 runs each, 33 runs per model.
 | Opus 5.5, `xhigh`, as Claude Code | 33 of 33 | 100% | 29.2 | 5.3 | not recorded |
 | Opus 4.8, `xhigh`, as Claude Code | 33 of 33 | 100% | 34.6 | 5.5 | 75 tok/s |
 | Opus 4.8, `low`, as Claude Code | 33 of 33 | 100% | 22.2 | 5.2 | 66 tok/s |
-| Opus 5.5, `xhigh`, inside the harness | 33 of 33 | 100% | 9.6 | 1.1 | not measured |
+| Opus 5.5, `xhigh`, inside tolken | 33 of 33 | 100% | 9.6 | 1.1 | not measured |
 | Ollama on a network server, `bonsai-2:27b`, 32,768-token window, thinking on | 26 of 33 | 78% | 37.7 | 1.1 | 47 tok/s |
 | llama-server, Bonsai-2 27B, 8,192-token window | 23 of 33 | 69% | 8.4 | 1.1 | 36 tok/s |
 | Ollama, `bonsai-2:27b`, 32,768-token window | 23 of 33 | 69% | 51.6 | 1.1 | 5 tok/s |
@@ -43,7 +43,7 @@ The harder task set: 11 tasks, 3 runs each, 33 runs per model.
 
 ## 64k context on the network Ollama
 
-Measured on 2026-11-18 with `bonsai-2:27b` on the network Ollama at a 65,536-token window, with the settings in `settings.json`: thinking on, temperature 0.6, `max_out` 8,000. "Before" is the harness of commit `318a1f7`, which kept one previous exchange and built every prompt afresh. "After" keeps the conversation and continues the previous call's prompt while it fits (see the top of `harness.py`). 3 runs per task.
+Measured on 2026-11-18 with `bonsai-2:27b` on the network Ollama at a 65,536-token window, with the settings in `settings.json`: thinking on, temperature 0.6, `max_out` 8,000. "Before" is tolken at commit `318a1f7`, which kept one previous exchange and built every prompt afresh. "After" keeps the conversation and continues the previous call's prompt while it fits (see the top of `tolken.py`). 3 runs per task.
 
 | | Before | After |
 |---|---|---|
@@ -60,13 +60,13 @@ Measured on 2026-11-18 with `bonsai-2:27b` on the network Ollama at a 65,536-tok
 - **The rest:**
   - `fix` failed once after and twice before; the model fixed only the precedence.
   - `wrap` failed once before, with wrong code.
-  - `shop` failed once before: the model wrote an empty edit block for `report.py`, which the harness read as deleting it.
+  - `shop` failed once before: the model wrote an empty edit block for `report.py`, which tolken read as deleting it.
 - **The saving from the cache hardly shows here,** because these tasks' prompts are small. It grows with the length of a conversation.
 
 ### The thinking row's failures
 
 - **`calc`:** in two runs the model thought for the whole 8,000 tokens (about 27,000 characters) and never wrote an answer. The third wrote a parser that failed the test. An earlier run with `max_out` at 2,000 was cut off the same way in all three `calc` runs, after about 44 seconds each.
-- **`wrap`:** in two runs the code was right in shape, but the model put the file under a folder named after the project (`tmpgfjy642_/wrap.py`), taking the prompt's `Project folder:` line as part of the path. The harness created that folder, so the test could not import `wrap`.
+- **`wrap`:** in two runs the code was right in shape, but the model put the file under a folder named after the project (`tmpgfjy642_/wrap.py`), taking the prompt's `Project folder:` line as part of the path. tolken created that folder, so the test could not import `wrap`.
 - **`fix` and `time`:** one wrong answer each.
 
 ## After the R1-R9 changes
@@ -89,7 +89,7 @@ Measured on 2026-11-19 with `bonsai-2:27b` on the network Ollama, with the setti
 | `tests` | 3 | 2 |
 | The other eight | 3 each | 3 each |
 
-- **The time difference is thinking.** Two `calc` runs took 519 and 444 seconds after, against 67 to 299 before. One `wrap` run (231 s) and one `time` run (161 s) were single calls. Without those three tasks the two harnesses take the same time. `think_max` would cap such runs.
+- **The time difference is thinking.** Two `calc` runs took 519 and 444 seconds after, against 67 to 299 before. One `wrap` run (231 s) and one `time` run (161 s) were single calls. Without those three tasks the two versions take the same time. `think_max` would cap such runs.
 - **Failures before:** `fix` fixed only the precedence; `merge` wrote wrong code.
 - **Failures after:**
   - `tests`: the model ran `python test_text.py`, which is not on the allowed list, so the benchmark refused it and the message ended.
@@ -103,25 +103,25 @@ Eight simpler tasks (greeting, reading a file before answering, a fact from an i
 | Model | Passed | Seconds per task |
 |---|---|---|
 | llama-server, Bonsai-2 27B | 21 of 24 | 4.0 |
-| Opus 5.5, default effort, inside the harness | 24 of 24 | 8.3 |
-| Opus 5.5, `xhigh`, inside the harness | 24 of 24 | 9.3 |
+| Opus 5.5, default effort, inside tolken | 24 of 24 | 8.3 |
+| Opus 5.5, `xhigh`, inside tolken | 24 of 24 | 9.3 |
 
 The local model's three failures were all the median fix.
 
 ## How it was measured
 
 - **Tasks:** each runs in a throwaway project of at most four small files. Every task's first prompt is under 1,000 tokens, so all of them fit the 8,192-token window. Most tasks ship a test file that defines success; a run passes when that test passes. The test file is restored before checking, so a model cannot pass by editing it.
-- **Local models:** run through the harness (`harness.Session`), with thinking off, temperature 0.2 and `max_out` 2,000. Every edit the model offers is accepted. The thinking row used the settings in `settings.json` instead: thinking on, temperature 0.6 and `max_out` 8,000, which thinking counts against.
+- **Local models:** run through tolken (`tolken.Session`), with thinking off, temperature 0.2 and `max_out` 2,000. Every edit the model offers is accepted. The thinking row used the settings in `settings.json` instead: thinking on, temperature 0.6 and `max_out` 8,000, which thinking counts against.
 - **Opus as Claude Code:** the `claude` command (version 2.1.326) works in the task's folder with Claude Code's own tools. It may read, create and edit files there and run Python to try the tests. User settings, `CLAUDE.md` and connectors are left out.
-- **Opus inside the harness:** the same prompts the local models get, with no tools.
+- **Opus inside tolken:** the same prompts the local models get, with no tools.
 - **Machine:** NVIDIA RTX 3070, 8 GB. The llama-server row ran with no Ollama model loaded, and the Ollama rows ran with llama-server stopped, so each had the GPU to itself. The thinking row ran on Ollama on another computer on the network, where the whole model (10 GB at a 32,768-token window) fit in GPU memory.
 - **Servers:** llama-server with `-c 8192` and a `q8_0` KV cache; Ollama 0.40.16 at its own context setting.
 
 ## Reading the numbers
 
-- **Score is specific to this harness and these tasks.** It is not a general measure of a model.
+- **Score is specific to tolken and these tasks.** It is not a general measure of a model.
 - **Three runs per task is a small sample.** A difference of one or two runs is noise.
-- **The 9B row understates that model.** Thirteen of its 22 failures were edits the harness could not read: the model closed the edit with a second `=======` line where `>>>>>>> REPLACE` belongs. The code was there, but the block was rejected.
+- **The 9B row understates that model.** Thirteen of its 22 failures were edits tolken could not read: the model closed the edit with a second `=======` line where `>>>>>>> REPLACE` belongs. The code was there, but the block was rejected.
 - **Answer speed** for local models is the generation speed their server reports. For Claude Code it is output tokens (thinking included) per second of model time, so the two are not directly comparable. It was not recorded for the first Opus 5.5 run.
 - **Seconds per task** for Claude includes starting the `claude` command and the network.
 - **Effort is not equal:** the local models ran with thinking off, apart from the thinking row.
@@ -136,7 +136,7 @@ As reported by the `claude` command for the harder set:
 | Opus 5.5, `xhigh`, as Claude Code | $3.48 |
 | Opus 4.8, `xhigh`, as Claude Code | $6.41 |
 | Opus 4.8, `low`, as Claude Code | $4.91 |
-| Opus 5.5, `xhigh`, inside the harness | $0.81 |
+| Opus 5.5, `xhigh`, inside tolken | $0.81 |
 
 ## Running it again
 
@@ -144,7 +144,7 @@ As reported by the `claude` command for the harder set:
 python bench.py --hard                                    # llama-server's model and Opus xhigh as Claude Code
 python bench.py --hard --models bonsai-2:27b qwen3:8b     # Ollama models, named as in /model
 python bench.py --hard --models cc:claude-opus-4-8:low    # another Claude model or effort, as Claude Code
-python bench.py --hard --models opus:xhigh                # Claude inside the harness
+python bench.py --hard --models opus:xhigh                # Claude inside tolken
 python bench.py --runs 1 --tasks fix time --save report.md
 python bench.py --tasks recall large --models bonsai-2:27b   # the longer tasks, several messages each
 ```
@@ -152,7 +152,7 @@ python bench.py --tasks recall large --models bonsai-2:27b   # the longer tasks,
 `bench.py` does not read `settings.json`. The thinking row and the 64k rows were run with the settings loaded first:
 
 ```
-python -c "import sys, harness, bench; harness.load_settings(); sys.argv[1:] = ['--hard', '--models', 'bonsai-2:27b']; bench.main()"
+python -c "import sys, tolken, bench; tolken.load_settings(); sys.argv[1:] = ['--hard', '--models', 'bonsai-2:27b']; bench.main()"
 ```
 
 Without `--hard` it runs the easy set. Stop llama-server before benchmarking Ollama models, and the other way round, or the two will share the GPU and the speed figures will be wrong.

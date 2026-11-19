@@ -1,6 +1,6 @@
 """Reading PDF, Word and image files for a model: their text, and images as PNG in base64.
 
-harness.py and web.py both use these.
+tolken.py and web.py both use these.
 """
 import base64
 import io

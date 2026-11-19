@@ -11,7 +11,7 @@ from unittest import mock
 
 from textual import events
 
-import harness
+import tolken
 import tui
 
 
@@ -70,13 +70,13 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             return answer
 
         self.shift = False  # what tui.shift_held() reports, instead of the real keyboard
-        patches = [mock.patch.object(harness, "chat", chat),
-                   mock.patch.object(harness, "count", lambda messages, url: sum(len(m["content"]) for m in messages) // 4),
+        patches = [mock.patch.object(tolken, "chat", chat),
+                   mock.patch.object(tolken, "count", lambda messages, url: sum(len(m["content"]) for m in messages) // 4),
                    mock.patch.object(tui, "shift_held", lambda: self.shift)]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.app = tui.HarnessApp(8192, "demo.gguf")
+        self.app = tui.TolkenApp(8192, "demo.gguf")
 
     def items(self):
         """The text of every item in the conversation area; for an answer, the markdown it shows."""
@@ -102,7 +102,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         self.answers = ["Hello there, friend."]
         async with self.app.run_test() as pilot:
             header = str(self.app.query_one("#header").content)
-            self.assertRegex(header, r"^harness · .+ · llama\.cpp · demo · 8,192 tokens$")
+            self.assertRegex(header, r"^tolken · .+ · llama\.cpp · demo · 8,192 tokens$")
             self.assertLessEqual(len(header), 100)
             self.assertTrue(self.status().startswith("ready │ 0/8,192 (0%)"))
             await self.submit(pilot, "zzz hi")
@@ -124,7 +124,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             return "NEED: a.py" if len(self.prompts) == 1 else "done"
 
         write("a.py", "x\n")
-        with mock.patch.object(harness, "chat", chat):
+        with mock.patch.object(tolken, "chat", chat):
             async with self.app.run_test() as pilot:
                 await self.submit(pilot, "zzz hi")
                 await self.until(pilot, lambda: not self.app.busy)
@@ -274,8 +274,8 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((f.read(), g.read()), ("1\n", "2\n"))
 
     async def test_the_settings_can_start_in_auto_mode(self):
-        with mock.patch.object(harness, "APPROVE", "auto"):
-            self.app = tui.HarnessApp(8192, "demo.gguf")
+        with mock.patch.object(tolken, "APPROVE", "auto"):
+            self.app = tui.TolkenApp(8192, "demo.gguf")
         async with self.app.run_test():
             self.assertEqual(str(self.app.prompt.border_subtitle), "auto · shift+tab")
 
@@ -356,7 +356,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 self.addCleanup(os.remove, saved)
                 with open(saved, "rb") as f:
                     self.assertEqual(f.read(), b"\x89PNG fake")
-                self.assertEqual(os.path.dirname(saved), os.path.join(tempfile.gettempdir(), "harness"))
+                self.assertEqual(os.path.dirname(saved), os.path.join(tempfile.gettempdir(), "tolken"))
                 await pilot.press("alt+v")
                 self.assertTrue(prompt.value.endswith("] hello"))
                 await pilot.press("alt+v")
@@ -385,7 +385,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         for key, kept in (("escape", True), ("enter", False)):
             with self.subTest(key=key):
                 write("a.txt", "one\ntwo\n")
-                self.app = tui.HarnessApp(8192, "demo.gguf")
+                self.app = tui.TolkenApp(8192, "demo.gguf")
                 self.answers = ["It is not needed.\nDELETE: a.txt\n"]
                 async with self.app.run_test() as pilot:
                     await self.submit(pilot, "zzz remove a.txt")
@@ -414,7 +414,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(items[3], "✗ " + failure)
             self.assertEqual(items[5], "I cannot find that line.")  # the model was told, and answered again
             # The file is shown with the failure, so its text can be copied exactly.
-            self.assertEqual(self.prompts[1], "--- a.txt (lines 1-1 of 1) ---\none\n\n" + failure + "\n" + harness.GO_ON)
+            self.assertEqual(self.prompts[1], "--- a.txt (lines 1-1 of 1) ---\none\n\n" + failure + "\n" + tolken.GO_ON)
             self.assertEqual(len(self.app.query(".card")), 0)
 
     async def test_multi_line_paste_is_sent_whole(self):
@@ -482,7 +482,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_slash_suggests_commands(self):
         self.answers = ["ok"]
-        with mock.patch.object(harness, "models", lambda: [harness.Llama(8192, "demo.gguf")]):
+        with mock.patch.object(tolken, "models", lambda: [tolken.Llama(8192, "demo.gguf")]):
             async with self.app.run_test() as pilot:
                 prompt, suggestions = self.app.prompt, self.app.suggestions
                 await self.type(pilot, "/")
@@ -597,7 +597,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_model_list_switches_the_model(self):
         small = FakeModel("small")
-        with mock.patch.object(harness, "models", lambda: [harness.Llama(8192, "demo.gguf"), small]):
+        with mock.patch.object(tolken, "models", lambda: [tolken.Llama(8192, "demo.gguf"), small]):
             async with self.app.run_test() as pilot:
                 await self.submit(pilot, "/model")
                 await self.until(pilot, lambda: self.app.models is not None)
@@ -623,7 +623,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_model_the_settings_name_is_loaded_at_startup(self):
         small = FakeModel("small")
-        with mock.patch.object(harness, "MODEL", "small"), mock.patch.object(harness, "models", lambda: [small]):
+        with mock.patch.object(tolken, "MODEL", "small"), mock.patch.object(tolken, "models", lambda: [small]):
             async with self.app.run_test() as pilot:
                 await self.until(pilot, lambda: self.app.session.model is small and not self.app.busy)
                 self.assertTrue(str(self.app.header.content).endswith(" · fake · small · 10,000 tokens"))
@@ -636,7 +636,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             ui.text("\n")
             return "The answer."
 
-        with mock.patch.object(harness, "chat", chat):
+        with mock.patch.object(tolken, "chat", chat):
             async with self.app.run_test() as pilot:
                 await self.submit(pilot, "zzz hi")
                 await self.until(pilot, lambda: not self.app.busy)
@@ -646,8 +646,8 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_model_by_name_unknown_name_and_failed_load(self):
         small, broken = FakeModel("small"), FakeModel("broken", fail=True)
-        found = [harness.Llama(8192, "demo.gguf"), small, broken]
-        with mock.patch.object(harness, "models", lambda: found):
+        found = [tolken.Llama(8192, "demo.gguf"), small, broken]
+        with mock.patch.object(tolken, "models", lambda: found):
             async with self.app.run_test() as pilot:
                 await self.submit(pilot, "/model sma")
                 await self.until(pilot, lambda: self.app.session.model is small and not self.app.busy)
@@ -657,8 +657,8 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 await self.until(pilot, lambda: "✗ could not load fake · broken: no such model" in self.items())
                 self.assertIs(self.app.session.model, small)
                 self.assertTrue(str(self.app.header.content).endswith(" · fake · small · 10,000 tokens"))
-        with mock.patch.object(harness, "models", lambda: []):
-            self.app = tui.HarnessApp(8192, "demo.gguf")
+        with mock.patch.object(tolken, "models", lambda: []):
+            self.app = tui.TolkenApp(8192, "demo.gguf")
             async with self.app.run_test() as pilot:
                 await self.submit(pilot, "/model")
                 await self.until(pilot, lambda: "✗ no model server answers" in self.items())

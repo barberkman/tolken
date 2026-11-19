@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal coding harness for a local llama-server with a small context window.
+"""tolken: a minimal coding harness for a local llama-server with a small context window.
 
 Run it from the project you want to ask about. A message is one model call, plus
 one for each time the model asks for more files or, after its edits, goes on.
@@ -41,8 +41,8 @@ written with the defaults when it is missing. Keys left out keep their defaults:
 Every prompt carries the project's file list. A pinned file also brings the
 project files it #includes, while they fit. Without a pin, the words of the
 question are searched in the current directory and the best-matching snippets
-are sent. If the model needs other files it replies "NEED: path ...", and the
-harness loads them and asks again, for as long as the files fit beside the code
+are sent. If the model needs other files it replies "NEED: path ...", and
+tolken loads them and asks again, for as long as the files fit beside the code
 already loaded. Loaded code stays until /clear.
 
 Each call continues the conversation of the call before: the new message holds
@@ -489,7 +489,7 @@ def search(question, budget, files=None):
 # ---------- display ----------
 
 class Plain:
-    """Shows the harness's output with print() and asks with input().
+    """Shows tolken's output with print() and asks with input().
 
     The full-screen interface (tui.py) provides the same methods, apart from yes().
     """
@@ -730,7 +730,7 @@ class Llama:
                       self.url)
 
     def leave(self):
-        """Called when another model is switched to. The harness cannot unload llama-server's model."""
+        """Called when another model is switched to. tolken cannot unload llama-server's model."""
 
     def count(self, messages):
         return count(messages, self.url)
@@ -1644,15 +1644,15 @@ def main():
 
 
 if __name__ == "__main__":
-    import harness  # this file again, as the module tui.py imports, so that both see the settings loaded here
-    harness.load_settings()
+    import tolken  # this file again, as the module tui.py imports, so that both see the settings loaded here
+    tolken.load_settings()
     if "--plain" in sys.argv or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        harness.main()
+        tolken.main()
     else:
         try:
             import tui
         except ImportError:
             print("[Textual is not installed (pip install textual); using the plain prompt]")
-            harness.main()
+            tolken.main()
         else:
             tui.run()

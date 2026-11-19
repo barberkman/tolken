@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark: run the same small coding tasks through the harness on several models.
+"""Benchmark: run the same small coding tasks through tolken on several models.
 
   python bench.py                           llama-server's model, and Opus at xhigh effort as Claude Code
   python bench.py --models qwen3:8b cc:opus choose the rows (see below)
@@ -7,14 +7,14 @@
   python bench.py --runs 1 --tasks create rename
   python bench.py --save report.md
 
-Rows: a name as in /model runs that model through the harness. cc:opus or
+Rows: a name as in /model runs that model through tolken. cc:opus or
 cc:opus:xhigh is Claude Code itself, working in the task's folder with its own
-tools. opus or opus:xhigh is Claude inside the harness, on the same prompts as
+tools. opus or opus:xhigh is Claude inside tolken, on the same prompts as
 the local models and with no tools. A full model name works in place of opus,
 for example cc:claude-opus-4-8:xhigh.
 
-Every task runs in a throwaway project and the result is checked. Through the
-harness, every edit the model offers is accepted. Claude is reached with the
+Every task runs in a throwaway project and the result is checked. Through
+tolken, every edit the model offers is accepted. Claude is reached with the
 `claude` command and your Claude Code login.
 """
 import argparse
@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 
-import harness
+import tolken
 
 WINDOW = 8192  # the context size prompts are built for when a Claude model is used
 CLAUDE_NAMES = ("opus", "fable", "sonnet", "haiku")  # model names the claude command understands
@@ -631,7 +631,7 @@ class ClaudeCode:
 
 
 class Claude:
-    """A Claude model with the same methods as harness.Llama and harness.Ollama, so a Session can use it."""
+    """A Claude model with the same methods as tolken.Llama and tolken.Ollama, so a Session can use it."""
 
     isolated = None  # the outcome of the isolation check, made once for all Claude rows
     tokenizer = None  # the URL of a llama-server, set by resolve(); its tokenizer counts the prompts
@@ -663,12 +663,12 @@ class Claude:
         """llama-server's tokenizer when it is up, so prompts are trimmed exactly as for the local model."""
         if Claude.tokenizer:
             try:
-                return harness.count(messages, Claude.tokenizer)
+                return tolken.count(messages, Claude.tokenizer)
             except OSError:
                 pass
         return sum(len(message["content"]) for message in messages) // 3
 
-    def chat(self, messages, ui=harness.PLAIN, session=None):
+    def chat(self, messages, ui=tolken.PLAIN, session=None):
         result = ask_claude(self.model, self.effort, messages[0]["content"], fold(messages[1:]))
         usage = result.get("usage") or {}
         self.cost += result.get("total_cost_usd") or 0
@@ -682,7 +682,7 @@ class Claude:
 # ---------- running ----------
 
 class Run:
-    """What happened in one run of a task. Also the display the harness reports to: it accepts every edit."""
+    """What happened in one run of a task. Also the display tolken reports to: it accepts every edit."""
 
     def __init__(self):
         self.calls, self.edits, self.problems, self.tokens, self.milliseconds = 0, [], [], 0, 0.0
@@ -725,7 +725,7 @@ def run_task(model, name):
     """One run of one task with one model, in a fresh temporary project."""
     files, messages, check = TASKS[name]
     run, home = Run(), os.getcwd()
-    session = harness.Session(run, model.size)
+    session = tolken.Session(run, model.size)
     session.model = model
     session.approve = "auto"  # every edit is accepted anyway, and the allowed commands run
     with tempfile.TemporaryDirectory() as folder:
@@ -738,7 +738,7 @@ def run_task(model, name):
         try:
             started = time.monotonic()
             for message in messages:
-                if isinstance(model, ClaudeCode):  # Claude Code does the task itself, not through the harness
+                if isinstance(model, ClaudeCode):  # Claude Code does the task itself, not through tolken
                     try:
                         run.answer = model.work(message, run)
                     except OSError as error:
@@ -756,17 +756,17 @@ def run_task(model, name):
 def resolve(names):
     """The models that the given names refer to.
 
-    cc:opus[:effort] is Claude Code itself; opus[:effort] is Claude inside the harness; the rest are as in /model.
+    cc:opus[:effort] is Claude Code itself; opus[:effort] is Claude inside tolken; the rest are as in /model.
     In place of opus, a full model name such as claude-opus-4-8 also works.
     """
-    found, rows = harness.models(), []
-    Claude.tokenizer = next((model.url for model in found if isinstance(model, harness.Llama)), None)
+    found, rows = tolken.models(), []
+    Claude.tokenizer = next((model.url for model in found if isinstance(model, tolken.Llama)), None)
     for name in names:
         kind = ClaudeCode if name.startswith("cc:") else Claude
         base, _, effort = name.removeprefix("cc:").partition(":")
         if base in CLAUDE_NAMES or base.startswith("claude-"):
             rows.append(kind(base, effort or None))
-        elif model := harness.pick(found, name):
+        elif model := tolken.pick(found, name):
             rows.append(model)
         else:
             print(f"[no single model matches {name!r}; skipped]")
@@ -800,10 +800,10 @@ def table(results, tasks):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the harness benchmark tasks on several models.")
+    parser = argparse.ArgumentParser(description="Run the tolken benchmark tasks on several models.")
     parser.add_argument("--models", nargs="+", default=["llama.cpp", "cc:opus:xhigh"],
                         help="names as in /model; cc:opus[:effort] for Claude Code itself; opus[:effort] for Claude "
-                             "inside the harness (default: llama.cpp cc:opus:xhigh)")
+                             "inside tolken (default: llama.cpp cc:opus:xhigh)")
     parser.add_argument("--hard", action="store_true", help="run the harder tasks: " + " ".join(HARD))
     parser.add_argument("--tasks", nargs="+", choices=list(TASKS), metavar="TASK",
                         help="run just these tasks (default: the easy ones, " + " ".join(EASY)
@@ -818,7 +818,7 @@ def main():
         try:
             model.enter()  # loads an Ollama model, or checks that the claude command is isolated
         except (OSError, KeyError, ValueError) as error:
-            print(f"[skipped: {harness.explain(error)}]")
+            print(f"[skipped: {tolken.explain(error)}]")
             continue
         results[model.label] = {task: [] for task in tasks}
         for task in tasks:
@@ -833,7 +833,7 @@ def main():
         # Report after every model, so a long run that is interrupted still leaves the finished rows.
         report = "\n".join([table(results, tasks), ""] + notes + [
             "tok/s: for local models, the answer speed their server reports. For Claude Code, output tokens "
-            "(thinking included) per second spent waiting for the model. Not measured for Claude inside the harness."])
+            "(thinking included) per second spent waiting for the model. Not measured for Claude inside tolken."])
         print("\n" + report + "\n", flush=True)
         if options.save:
             with open(options.save, "w", encoding="utf-8") as f:

@@ -3,7 +3,7 @@
 
   python web.py      serves http://127.0.0.1:8765 (WEB_PORT changes it) and opens it
 
-It talks to the model servers that harness.py knows (Ollama and llama-server),
+It talks to the model servers that tolken.py knows (Ollama and llama-server),
 with the same settings.json, and starts on the same model: the one the settings
 name, else the first listed. Images reach a model only if it can read them (an
 Ollama model with the "vision" capability). The page's ASCII button asks the
@@ -19,7 +19,7 @@ import webbrowser
 
 import flask
 
-import harness
+import tolken
 from documents import read_docx, read_pdf
 
 PORT = int(os.environ.get("WEB_PORT", "8765"))
@@ -32,10 +32,10 @@ current = None  # the model in use; main() starts on the settings' model, and th
 def vision(model):
     """Whether the model can read images."""
     try:
-        if isinstance(model, harness.Ollama):
-            with harness.post("/api/show", {"model": model.name}, model.url) as response:
+        if isinstance(model, tolken.Ollama):
+            with tolken.post("/api/show", {"model": model.name}, model.url) as response:
                 return "vision" in (json.load(response).get("capabilities") or [])
-        return bool(harness.props(model.url).get("modalities", {}).get("vision"))
+        return bool(tolken.props(model.url).get("modalities", {}).get("vision"))
     except (OSError, ValueError):
         return False
 
@@ -43,13 +43,13 @@ def vision(model):
 def listing():
     """The models that can be chosen, for the page's model list."""
     return [{"label": model.label, "detail": model.detail, "vision": vision(model),
-             "current": current is not None and model.label == current.label} for model in harness.models()]
+             "current": current is not None and model.label == current.label} for model in tolken.models()]
 
 
 def use(label):
-    """Switch to the model with this label, like Session.use in harness.py."""
+    """Switch to the model with this label, like Session.use in tolken.py."""
     global current
-    model = next((model for model in harness.models() if model.label == label), None)
+    model = next((model for model in tolken.models() if model.label == label), None)
     if model is None:
         raise ValueError(f"no model is called {label}")
     if current is not None and current.label != model.label:
@@ -63,7 +63,7 @@ def use(label):
 def tokens(messages, model):
     """The prompt size of messages: the model's count of the text, plus an estimate for each image."""
     images = sum(len(message.get("images") or ()) for message in messages)
-    return model.count(messages) + harness.IMAGE_TOKENS * images + harness.MARGIN
+    return model.count(messages) + tolken.IMAGE_TOKENS * images + tolken.MARGIN
 
 
 def fit(messages, model):
@@ -71,7 +71,7 @@ def fit(messages, model):
 
     The messages are None when the newest one does not fit on its own.
     """
-    while (used := tokens(messages, model)) > model.size - harness.answer_room(model.size):
+    while (used := tokens(messages, model)) > model.size - tolken.answer_room(model.size):
         if len(messages) < 3:
             return None, used
         messages = messages[2:]  # one user message and its answer
@@ -79,7 +79,7 @@ def fit(messages, model):
 
 
 class Writer:
-    """The ui that harness.stream passes the answer to: it puts each piece in a queue."""
+    """The ui that tolken.stream passes the answer to: it puts each piece in a queue."""
 
     def __init__(self, pieces):
         self.pieces = pieces
@@ -95,15 +95,15 @@ class Writer:
 
 
 class Call:
-    """What harness.stream needs so that the call can be ended from another thread."""
+    """What tolken.stream needs so that the call can be ended from another thread."""
     sock, stopped, process = None, False, None  # process: a command; the web chat runs none
-    cancel = harness.Session.cancel  # sets stopped and closes sock, which is all it uses
+    cancel = tolken.Session.cancel  # sets stopped and closes sock, which is all it uses
 
 
 def answer(model, messages):
     """The model's answer, piece by piece. An error after the answer has started comes as NUL and its text.
 
-    The model is called in a thread, since harness.stream hands out the pieces
+    The model is called in a thread, since tolken.stream hands out the pieces
     instead of returning them. When the page goes away (Stop), the generator is
     closed and the call is ended.
     """
@@ -114,7 +114,7 @@ def answer(model, messages):
             model.chat(messages, Writer(pieces), call)
         except OSError as error:
             if not call.stopped:
-                pieces.put("\0" + harness.explain(error))
+                pieces.put("\0" + tolken.explain(error))
         finally:
             pieces.put(None)
 
@@ -161,7 +161,7 @@ def chat():
     fitted, used = fit(messages, model)
     if fitted is None:
         raise ValueError(f"the message is too long for {model.label}: "
-                         f"about {used:,} tokens, and {model.size - harness.answer_room(model.size):,} fit")
+                         f"about {used:,} tokens, and {model.size - tolken.answer_room(model.size):,} fit")
     return flask.Response(answer(model, fitted), mimetype="text/plain",
                           headers={"X-Dropped": str(len(messages) - len(fitted))})  # earlier messages left out
 
@@ -171,13 +171,13 @@ def chat():
 @app.errorhandler(KeyError)
 @app.errorhandler(RuntimeError)  # PyMuPDF's errors
 def refuse(error):
-    return {"error": harness.explain(error)}, 400
+    return {"error": tolken.explain(error)}, 400
 
 
 def start():
-    """Switch to the model to start with, as harness.py does: the one settings.json names, else the first listed."""
-    name = harness.startup()
-    model = harness.pick(harness.models(), name) if name else None
+    """Switch to the model to start with, as tolken.py does: the one settings.json names, else the first listed."""
+    name = tolken.startup()
+    model = tolken.pick(tolken.models(), name) if name else None
     if name and not model:
         print(f"[no single model matches {name!r}]")
     elif model:
@@ -185,11 +185,11 @@ def start():
         try:
             use(model.label)
         except (OSError, KeyError, ValueError) as error:
-            print(f"[could not load {model.label}: {harness.explain(error)}]")
+            print(f"[could not load {model.label}: {tolken.explain(error)}]")
 
 
 def main():
-    harness.load_settings()  # the same servers and options as the harness
+    tolken.load_settings()  # the same servers and options as tolken
     start()
     logging.getLogger("werkzeug").setLevel(logging.ERROR)  # no line per request
     url = f"http://127.0.0.1:{PORT}"

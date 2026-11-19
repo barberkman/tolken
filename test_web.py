@@ -13,7 +13,7 @@ from unittest import mock
 import fitz
 
 import documents
-import harness
+import tolken
 import web
 
 
@@ -115,16 +115,16 @@ def exchange(*texts):
 class Fit(unittest.TestCase):
     # Fake counts characters; the window leaves size - MAX_OUT - MARGIN of them for the prompt.
     def setUp(self):
-        patch = mock.patch.object(harness, "MAX_OUT", 0)  # so the answer's share of these tiny windows stays 0
+        patch = mock.patch.object(tolken, "MAX_OUT", 0)  # so the answer's share of these tiny windows stays 0
         patch.start()
         self.addCleanup(patch.stop)
 
     def model(self, room):
-        return Fake(size=room + harness.MAX_OUT + harness.MARGIN)
+        return Fake(size=room + tolken.MAX_OUT + tolken.MARGIN)
 
     def test_everything_kept_when_it_fits(self):
         messages = exchange("a" * 10, "b" * 10, "c" * 10)
-        self.assertEqual(web.fit(messages, self.model(30)), (messages, 30 + harness.MARGIN))
+        self.assertEqual(web.fit(messages, self.model(30)), (messages, 30 + tolken.MARGIN))
 
     def test_oldest_exchanges_dropped_first(self):
         messages = exchange("a" * 10, "b" * 10, "c" * 10, "d" * 10, "e" * 10)
@@ -142,7 +142,7 @@ class Fit(unittest.TestCase):
     def test_newest_message_alone_too_long(self):
         fitted, used = web.fit(exchange("a", "b", "c" * 50), self.model(20))
         self.assertIsNone(fitted)
-        self.assertEqual(used, 50 + harness.MARGIN)
+        self.assertEqual(used, 50 + tolken.MARGIN)
 
 
 class Endless(Fake):
@@ -202,7 +202,7 @@ class Server(unittest.TestCase):
         self.assertIsNone(web.current.sent)
 
     def test_too_long_message_refused(self):
-        web.current = Fake(size=harness.MARGIN + 70)  # 3 characters are left for the prompt
+        web.current = Fake(size=tolken.MARGIN + 70)  # 3 characters are left for the prompt
         response = self.client.post("/chat", json={"messages": exchange("x" * 100)})
         self.assertEqual(response.status_code, 400)
         self.assertIn("too long", response.json["error"])
@@ -210,7 +210,7 @@ class Server(unittest.TestCase):
     def test_switching_leaves_the_old_model_and_enters_the_new(self):
         old, new = Fake("old"), Fake("new", size=4096)
         web.current = old
-        with mock.patch.object(harness, "models", return_value=[old, new]),              mock.patch.object(web, "vision", return_value=True):
+        with mock.patch.object(tolken, "models", return_value=[old, new]),              mock.patch.object(web, "vision", return_value=True):
             response = self.client.post("/model", json={"label": "new"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json, {"label": "new", "size": 4096, "vision": True})
@@ -222,11 +222,11 @@ class Server(unittest.TestCase):
     def test_start_loads_the_model_the_settings_name_else_the_first_listed(self):
         first, second = Fake("ollama · first"), Fake("ollama · second")
         first.name, second.name = "first", "second"
-        with mock.patch.object(harness, "models", return_value=[first, second]), \
+        with mock.patch.object(tolken, "models", return_value=[first, second]), \
                 mock.patch.object(web, "vision", return_value=False), mock.patch("builtins.print"):
             web.start()
             self.assertIs(web.current, first)
-            with mock.patch.object(harness, "MODEL", "second"):
+            with mock.patch.object(tolken, "MODEL", "second"):
                 web.start()
             self.assertIs(web.current, second)
             self.assertEqual((first.calls, second.calls), (["enter", "leave"], ["enter"]))
@@ -234,7 +234,7 @@ class Server(unittest.TestCase):
             self.assertEqual([m["current"] for m in response.json], [False, True])  # what the page opens on
 
     def test_unknown_model_refused(self):
-        with mock.patch.object(harness, "models", return_value=[]):
+        with mock.patch.object(tolken, "models", return_value=[]):
             response = self.client.post("/model", json={"label": "nope"})
         self.assertEqual(response.status_code, 400)
         self.assertIn("nope", response.json["error"])

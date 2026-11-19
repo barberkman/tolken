@@ -1,6 +1,6 @@
-"""Full-screen interface for harness.py, built with Textual.
+"""Full-screen interface for tolken.py, built with Textual.
 
-`python harness.py` starts it when run in a terminal. Enter sends a message;
+`python tolken.py` starts it when run in a terminal. Enter sends a message;
 Shift+Enter starts a new line (on Windows, or where the terminal reports that
 key), and Ctrl+J does so everywhere.
 Esc cancels the running one, PageUp/PageDown scroll, Ctrl+Q or /exit quits.
@@ -49,7 +49,7 @@ from textual.markup import escape
 from textual.message import Message
 from textual.widgets import Markdown, Static, TextArea
 
-import harness
+import tolken
 
 PLACEHOLDER = "Ask about this project · @file pins code · / for commands"
 COMMANDS = {  # what typing / offers, in this order
@@ -78,7 +78,7 @@ RED, GREEN, GREY = "#e06c75", "#98c379", "#777777"
 
 
 class Display:
-    """What harness.Session reports to. Its methods are called from the worker thread."""
+    """What tolken.Session reports to. Its methods are called from the worker thread."""
 
     def __init__(self, app):
         self.app = app
@@ -229,7 +229,7 @@ def dropped(text):
 
 def save_image(png):
     """Save an image from the clipboard as a PNG in a temporary folder; return its path."""
-    folder = os.path.join(tempfile.gettempdir(), "harness")
+    folder = os.path.join(tempfile.gettempdir(), "tolken")
     os.makedirs(folder, exist_ok=True)
     stem = os.path.join(folder, time.strftime("clipboard-%Y%m%d-%H%M%S"))
     path = next(f"{stem}{suffix}.png" for suffix in itertools.chain([""], (f"-{n}" for n in itertools.count(2)))
@@ -291,21 +291,21 @@ def diff_card(path, old, new):
 
 def without_blocks(text, path):
     """text without the SEARCH/REPLACE blocks for path (and the code fence around each)."""
-    for block in reversed(list(harness.BLOCK.finditer(text))):
-        if harness.block_path(block[1]) == path:
+    for block in reversed(list(tolken.BLOCK.finditer(text))):
+        if tolken.block_path(block[1]) == path:
             head = re.sub(r"(^|\n)```[^\n]*\n\Z", r"\1", text[:block.start()])
             tail = re.sub(r"\A\n```[ \t]*(?=\n|\Z)", "", text[block.end():])
             text = head + tail
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-PROTOCOL = re.compile(r"^(?:NEED:|RUN:|DELETE:|FILE:|CONTINUE\b)")  # the harness's lines in an answer
+PROTOCOL = re.compile(r"^(?:NEED:|RUN:|DELETE:|FILE:|CONTINUE\b)")  # tolken's lines in an answer
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def displayed(text):
     """An answer as the markdown to show: edit blocks outside code fences are put in one, so that
-    their ======= and >>>>>>> lines do not show as a heading and quotes, and the harness's lines
+    their ======= and >>>>>>> lines do not show as a heading and quotes, and tolken's lines
     (NEED:, RUN:...) stand as paragraphs of their own.
 
     Only whole lines are changed, so the result grows as the answer streams in; a block still
@@ -453,7 +453,7 @@ class Prompt(TextArea):
 
     def attach(self, path):
         """Put a short marker for a file in the input; take() turns it into a pin of the file."""
-        marker = f"[{'image' if harness.kind(path) == 'image' else 'file'} {os.path.basename(path)}]"
+        marker = f"[{'image' if tolken.kind(path) == 'image' else 'file'} {os.path.basename(path)}]"
         if marker in self.pastes:
             marker = f"{marker[:-1]} #{len(self.pastes) + 1}]"
         self.pastes[marker] = (os.path.abspath(path),)  # a tuple: a file, where a pasted text is a string
@@ -471,8 +471,8 @@ class Prompt(TextArea):
         return typed, message.strip()
 
 
-class HarnessApp(App):
-    TITLE = "harness"
+class TolkenApp(App):
+    TITLE = "tolken"
     CSS = """
     #header { height: 1; padding: 0 1; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
     #conversation {
@@ -512,7 +512,7 @@ class HarnessApp(App):
 
     def __init__(self, size, model=""):
         super().__init__()
-        self.session = harness.Session(Display(self), size, model)
+        self.session = tolken.Session(Display(self), size, model)
         self.models = None  # the models on offer while the /model list is open
         self.commands = None  # the command names on offer while the / list is open
         self.loading = False  # models are being listed or one is being loaded; Esc cannot cancel that
@@ -539,7 +539,7 @@ class HarnessApp(App):
             folder = "~" + folder[len(home):]
         if len(folder) > 40:  # keep the end of a long path, so the model and context size stay visible
             folder = "…" + folder[-39:]
-        return f"harness · {folder} · {self.session.model.label} · {self.session.size:,} tokens"
+        return f"tolken · {folder} · {self.session.model.label} · {self.session.size:,} tokens"
 
     def compose(self):
         self.header = Static(self.header_text(), id="header", markup=False)
@@ -560,8 +560,8 @@ class HarnessApp(App):
         self.show_approval()
         self.set_interval(0.1, self.tick)
         self.tick()
-        if harness.MODEL:  # the model the settings start with, switched to as /model NAME would
-            self.run_model(lambda: self.find_model(harness.MODEL), f"loading {harness.MODEL}")
+        if tolken.MODEL:  # the model the settings start with, switched to as /model NAME would
+            self.run_model(lambda: self.find_model(tolken.MODEL), f"loading {tolken.MODEL}")
 
     def on_unmount(self):
         self.session.cancel()
@@ -702,7 +702,7 @@ class HarnessApp(App):
             self.matches, self.choice = [f"{name:<8}{COMMANDS[name]}" for name in self.commands], 0
         elif word and not self.asking:
             if self.files is None:  # the list is opening: read the project once
-                self.files = harness.readable_files()
+                self.files = tolken.readable_files()
             self.matches, self.choice = matching(self.files, word[1]), 0
         else:
             self.files, self.matches = None, []
@@ -825,12 +825,12 @@ class HarnessApp(App):
 
     def find_model(self, wanted):
         """Runs in a worker thread: open the model list, or switch straight to the model that wanted names."""
-        ui, found = self.session.ui, harness.models()
+        ui, found = self.session.ui, tolken.models()
         if not found:
             ui.note("no model server answers", "bad")
         elif not wanted:
             ui.on_screen(self.show_models, found)
-        elif model := harness.pick(found, wanted):
+        elif model := tolken.pick(found, wanted):
             self.session.use(model)
         else:
             ui.note(f"no single model matches {wanted!r}", "bad")
@@ -901,7 +901,7 @@ class HarnessApp(App):
         body = Text("\n".join(lines[-OUTPUT_LINES:]) or "(no output)", GREY)
         if len(lines) > OUTPUT_LINES:
             body = Text(f"⋮ {len(lines) - OUTPUT_LINES} lines above\n", GREY) + body
-        ended = f"stopped after {harness.RUN_TIMEOUT} s" if code is None else f"exit {code} · {seconds:.1f}s"
+        ended = f"stopped after {tolken.RUN_TIMEOUT} s" if code is None else f"exit {code} · {seconds:.1f}s"
         card = self.add(body, "card")
         if card:
             card.border_title = escape(f"{command} · {ended}")
@@ -989,5 +989,5 @@ class HarnessApp(App):
 
 def run():
     """Start the interface. Finds the model to start with first, while printing still works."""
-    harness.MODEL = harness.startup()  # on_mount switches to it
-    HarnessApp(8192).run()
+    tolken.MODEL = tolken.startup()  # on_mount switches to it
+    TolkenApp(8192).run()

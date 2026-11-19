@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 import bench
-import harness
+import tolken
 
 BLOCK = "FILE: {0}\n<<<<<<< SEARCH\n{1}\n=======\n{2}\n>>>>>>> REPLACE\n"
 FIB = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"
@@ -378,9 +378,9 @@ class ClaudeCommand(unittest.TestCase):
     def test_count_uses_the_local_tokenizer_or_an_estimate(self):
         messages = [{"content": "x" * 30}]
         with mock.patch.object(bench.Claude, "tokenizer", "http://llama"):
-            with mock.patch.object(harness, "count", lambda messages, url: 7 if url == "http://llama" else 0):
+            with mock.patch.object(tolken, "count", lambda messages, url: 7 if url == "http://llama" else 0):
                 self.assertEqual(bench.Claude("opus").count(messages), 7)
-            with mock.patch.object(harness, "count", side_effect=OSError):
+            with mock.patch.object(tolken, "count", side_effect=OSError):
                 self.assertEqual(bench.Claude("opus").count(messages), 10)
         with mock.patch.object(bench.Claude, "tokenizer", None):  # no llama-server listed
             self.assertEqual(bench.Claude("opus").count(messages), 10)
@@ -413,8 +413,8 @@ class Report(unittest.TestCase):
         self.assertTrue(bench.table({"local": {"greet": [self.run_with()]}}, ["greet"]).endswith("No failed runs."))
 
     def test_resolve_names(self):
-        found = [harness.Llama(8192, "demo.gguf"), harness.Ollama("qwen3:8b")]
-        with mock.patch.object(harness, "models", lambda: found), mock.patch("builtins.print") as printed, \
+        found = [tolken.Llama(8192, "demo.gguf"), tolken.Ollama("qwen3:8b")]
+        with mock.patch.object(tolken, "models", lambda: found), mock.patch("builtins.print") as printed, \
                 mock.patch.object(bench.Claude, "tokenizer", None):
             rows = bench.resolve(["llama.cpp", "qwen3:8b", "opus", "opus:xhigh", "cc:opus", "cc:opus:xhigh", "nothing",
                                   "cc:claude-opus-4-8:xhigh"])
