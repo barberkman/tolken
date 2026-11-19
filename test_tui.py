@@ -3,6 +3,7 @@
 The model is replaced by canned answers; no llama-server is needed.
 """
 import os
+import re
 import tempfile
 import threading
 import time
@@ -145,6 +146,25 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("2 calls", items[5])
             self.assertIn("body of a", self.prompts[1])
 
+    async def test_a_phrase_shows_above_the_input_while_working(self):
+        self.answers = ["A long answer that never ends"]
+        self.hold = threading.Event()
+        async with self.app.run_test() as pilot:
+            flavor = self.app.query_one("#flavor")
+            self.assertFalse(flavor.display)
+            await self.submit(pilot, "zzz first")
+            await self.until(pilot, lambda: "A long" in self.items())
+            self.assertTrue(flavor.display)
+            line = re.fullmatch(r"✦ (.+…) \(↓ 1 token\)", str(flavor.content))  # one piece is about a token
+            self.assertIn(line[1], tui.PHRASES)  # and too soon for a speed
+            self.app.call_first -= 2  # as if the first piece came two seconds before the last
+            await pilot.pause(0.15)
+            self.assertRegex(str(flavor.content), r"\(↓ 1 token · \d+ tok/s\)$")
+            self.assertTrue(self.status().startswith("answering · "))  # the status bar keeps its text
+            self.hold.set()
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertFalse(flavor.display)
+
     async def test_escape_cancels_and_the_next_message_works(self):
         self.answers = ["A long answer that never ends", "Second answer."]
         self.hold = threading.Event()
@@ -196,6 +216,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             prompt = self.app.prompt
             await self.submit(pilot, "zzz change two")
             await self.until(pilot, lambda: self.app.asking)
+            self.assertFalse(self.app.query_one("#flavor").display)  # the model is not working while it waits
             self.assertEqual(self.status().split(" │ ")[0], "apply edit?")
             self.assertTrue(self.status().endswith("│ " + tui.EDIT_KEYS))
             self.assertEqual(str(prompt.border_title), "Apply this change to a.txt?")

@@ -27,12 +27,15 @@ A file dragged onto the window (its path pasted) is attached, as [file name]
 in the input: a PDF or Word file goes to the model as its text, an image to a
 model that can see. Alt+V attaches the files copied in Explorer, or an image
 on the clipboard (saved to a temporary folder), and pastes text as usual.
+While a message is answered, a random Middle-earth phrase is shown above the input,
+with the tokens streamed so far and the speed of the current call.
 """
 import asyncio
 import collections
 import difflib
 import itertools
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -63,6 +66,22 @@ DELETE_KEYS = "enter delete · esc keep"
 RUN_KEYS = "enter run · esc refuse"
 OUTPUT_LINES = 12  # lines of a command's output shown in its card (the model gets more)
 NEWLINE_KEYS = ("shift+enter", "ctrl+j")  # Shift+Enter only where the terminal reports it; Ctrl+J everywhere
+PHRASES = (  # shown above the input while the model works, one picked at random per message
+    "Consulting the Palantír…", "Riddling in the dark…", "Pondering the Red Book…", "Smoking pipe-weed on it…",
+    "Entmooting…", "Lighting the beacons…", "Speaking friend and entering…", "Delving too greedily and too deep…",
+    "Tracking like a Ranger…", "Seeking the Arkenstone…", "Saddling Shadowfax…", "Waking the Ents…",
+    "Rekindling the forges…", "Writing in the Red Book…", "Translating from Elvish…", "Singing of great deeds…",
+    "Having second breakfast…", "Nibbling on lembas…", "Walking into Mordor…", "Following the Road ever on…",
+    "Wandering, but not lost…", "Asking the Eagles…", "Reading Thrór's map…", "Searching for moon-letters…",
+    "Climbing the stairs of Cirith Ungol…", "Crossing the Misty Mountains…", "Holding council at Rivendell…",
+    "Asking Tom Bombadil…", "Gathering the Fellowship…", "Sneaking past Smaug…", "Mustering the Rohirrim…",
+    "Reforging Narsil…", "Polishing Sting…", "Hiding from the Eye…", "Arguing with Gollum…",
+    "Taking the hobbits to Isengard…",
+    "Counting tokens, my precious…", "Forging the One Token…", "One token to rule them all…",
+    "Tokenizing the Shire…", "Detokenizing Elvish…", "Quantizing the Silmarils…", "Compressing the Silmarillion…",
+    "Decoding the runes…", "Embedding Elvish runes…", "Attending to every token…", "Prompting the Ents…",
+    "Raising the temperature of Mount Doom…", "Hallucinating a second breakfast…", "Unrolling the map of Middle-earth…",
+)
 
 
 def shift_held():
@@ -491,6 +510,7 @@ class TolkenApp(App):
     Prompt { border-subtitle-color: $text-muted; }
     Prompt.auto { border-subtitle-color: #e5c07b; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
+    #flavor { display: none; height: 1; padding: 0 1; color: #e5c07b; text-style: italic; }
     .user { margin-top: 1; text-style: bold; }
     .info { color: $text-muted; }
     .thinking { color: $text-muted; text-style: italic; }
@@ -526,6 +546,10 @@ class TolkenApp(App):
         self.started = self.call_started = 0.0
         self.calls, self.call_timings = 0, []
         self.hint_text, self.hint_until = "", 0.0  # a short message in the status bar, and when it expires
+        self.phrase = self.last_phrase = ""  # the phrase shown while working ("" when idle), and the one shown last
+        self.generated = 0  # pieces (each about a token) of thinking and answer streamed for this message
+        self.call_from = 0  # self.generated when the current call started
+        self.call_first = self.call_last = 0.0  # when the current call's first and latest pieces arrived
         self.quit_until = 0.0  # a second Ctrl+C with nothing selected before this time quits
         self.history = []  # the messages sent so far, each as (typed text, its pasted blocks)
         self.history_at = None  # which of them Up/Down has put in the input; None when it holds new text
@@ -547,9 +571,11 @@ class TolkenApp(App):
         self.prompt = Prompt(PLACEHOLDER)
         self.status_bar = Static(id="status", markup=False)
         self.suggestions = Static(id="suggestions", markup=False)
+        self.flavor = Static(id="flavor", markup=False)
         yield self.header
         yield self.conversation
         yield self.suggestions
+        yield self.flavor
         yield self.prompt
         yield self.status_bar
 
@@ -598,9 +624,12 @@ class TolkenApp(App):
         if not (self.pieces or self.thoughts) or not self.conversation.is_attached:  # nothing new, or closing
             return
         follow = self.at_end()
+        self.call_last = time.monotonic()  # for the speed shown above the input
+        self.call_first = self.call_first or self.call_last
         if self.thoughts:
             while self.thoughts:
                 self.thought_text += self.thoughts.popleft()
+                self.generated += 1
             if self.thought_text.strip():
                 self.thought = self.show_stream(self.thought, self.thought_text, "thinking")
                 if self.activity == "waiting for model":
@@ -608,6 +637,7 @@ class TolkenApp(App):
         if self.pieces:
             while self.pieces:
                 self.answer_text += self.pieces.popleft()
+                self.generated += 1
             if self.answer_text.strip():
                 self.answer = self.show_stream(self.answer, self.answer_text, "answer")
                 if self.activity in ("waiting for model", "thinking"):
@@ -634,13 +664,27 @@ class TolkenApp(App):
     def set_activity(self, text, call=None, used=None):
         self.activity = text
         if call:
+            self.flush()  # pieces of the call before still waiting count for that one, not this one
             self.call, self.used, self.calls = call, used, call
             self.call_started = time.monotonic()
+            self.call_from, self.call_first = self.generated, 0.0
         self.tick()
 
     def tick(self):
-        """Runs ten times a second: show new answer text and refresh the status bar."""
+        """Runs ten times a second: show new answer text, the phrase above the input, and refresh the status bar."""
         self.flush()
+        if not self.busy:
+            self.phrase, self.generated = "", 0
+        elif not self.phrase:  # a message (or a model load) has started: pick a phrase for it
+            self.phrase = self.last_phrase = random.choice([p for p in PHRASES if p != self.last_phrase])
+        line = "✦ " + self.phrase
+        if self.generated:
+            line += f" (↓ {self.generated:,} token{'s' * (self.generated != 1)}"
+            if self.call_last - self.call_first >= 1:  # streamed long enough for a steady speed
+                line += f" · {(self.generated - self.call_from) / (self.call_last - self.call_first):.0f} tok/s"
+            line += ")"
+        self.flavor.update(line)
+        self.flavor.display = self.busy and not self.asking
         size = self.session.size
         parts = [self.activity]
         if self.busy and not self.asking:
