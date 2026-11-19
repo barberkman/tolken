@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local chat</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66; --line: #dcdcd6;
+    --user: #e9eef6; --accent: #2f6fd6; --bad: #c0392b; --good: #2e8b57;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #1f1f1d; --text: #e6e6e1; --muted: #9a9a93; --line: #34342f;
+            --user: #232b38; --accent: #6a9cf0; --bad: #e06c5f; --good: #5cbf85; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif;
+         display: flex; flex-direction: column; }
+  header, footer { background: var(--panel); border-color: var(--line); border-style: solid; border-width: 0; }
+  header { border-bottom-width: 1px; padding: 8px 16px; display: flex; gap: 8px; align-items: center; }
+  header .status { color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  footer { border-top-width: 1px; padding: 8px 16px 12px; }
+  main { flex: 1; overflow-y: auto; padding: 16px; }
+  .column { max-width: 960px; margin: 0 auto; }
+  select, button, textarea { font: inherit; color: inherit; background: var(--bg);
+                             border: 1px solid var(--line); border-radius: 6px; }
+  select { padding: 4px 6px; max-width: 50%; }
+  button { padding: 5px 12px; cursor: pointer; }
+  button:disabled, select:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .msg { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; background: var(--panel);
+         border: 1px solid var(--line); position: relative; }
+  .msg.user { background: var(--user); }
+  .msg pre { margin: 0; font: 13px/1.4 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  .msg.ascii pre { white-space: pre; word-break: normal; overflow-x: auto; }
+  .msg .copy { position: absolute; top: 6px; right: 6px; padding: 2px 8px; font-size: 12px; }
+  .msg.answer pre { padding-right: 56px; }
+  .files { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 4px 2px 6px; font-size: 12px;
+          border: 1px solid var(--line); border-radius: 6px; background: var(--panel); max-width: 240px; }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip img { height: 32px; max-width: 64px; object-fit: cover; border-radius: 3px; }
+  .chip button { border: 0; padding: 0 4px; background: none; }
+  .note { color: var(--muted); font-size: 12px; margin: -4px 0 12px; }
+  .note.bad { color: var(--bad); }
+  .note.good { color: var(--good); }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea { flex: 1; resize: none; padding: 7px 10px; min-height: 38px; max-height: 40vh; background: var(--bg); }
+  .drop main { outline: 2px dashed var(--accent); outline-offset: -8px; }
+</style>
+</head>
+<body>
+<header>
+  <select id="model" title="Model"></select>
+  <span class="status" id="status">loading models…</span>
+  <button id="new" title="Forget the conversation">New chat</button>
+</header>
+<main id="log"><div class="column" id="messages"></div></main>
+<footer>
+  <div class="column">
+    <div class="files" id="chips"></div>
+    <div class="row">
+      <button id="attach" title="Attach images, PDFs, Word documents or text files (or paste / drop them)">📎</button>
+      <input type="file" id="file" multiple hidden>
+      <textarea id="input" rows="1" placeholder="Message · Enter sends, Shift+Enter new line · paste or drop files"></textarea>
+      <button id="ascii" title="Redraw each attached image as an ASCII diagram">ASCII</button>
+      <button id="send" class="primary">Send</button>
+      <button id="stop" hidden>Stop</button>
+    </div>
+  </div>
+</footer>
+<script>
+const ASCII_PROMPT = "Redraw this image as a plain-text ASCII diagram for pasting into a chat. "
+  + "Keep the layout, boxes, arrows, labels and all text. Use only ASCII characters. "
+  + "Output only the diagram in one code block, no explanation.";
+const MAX_SIDE = 1280;  // images are shrunk to at most this many pixels on their longest side
+
+let models = [];        // [{label, detail, vision, current}] from the server
+let history = [];       // messages as sent to the model: {role, content, images?}
+let attachments = [];   // {name, kind: "image" | "text", data}
+let controller = null;  // the running request, for Stop
+let stopped = false;
+
+const $ = id => document.getElementById(id);
+const model = () => models.find(m => m.current);  // the one web.py is using: the settings' model at first
+
+// ---------- models ----------
+
+async function loadModels() {
+  try {
+    models = await (await fetch("/models")).json();
+  } catch (e) {
+    return status("cannot reach web.py");
+  }
+  const select = $("model");
+  select.replaceChildren(...models.map(m =>
+    new Option(`${m.label} · ${m.detail}${m.vision ? "" : " · text only"}`, m.label)));
+  if (!models.length) return status("no model server answers; start one and reload");
+  const pick = model() || models.find(m => m.vision) || models[0];
+  select.value = pick.label;
+  if (pick.current) status(`${pick.label}${pick.vision ? "" : " · text only"}`);
+  else await choose(pick.label);
+  refresh();
+}
+
+async function choose(label) {
+  $("model").disabled = true;
+  status(`loading ${label}…`);
+  try {
+    const response = await fetch("/model", {method: "POST", body: JSON.stringify({label})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    models.forEach(m => m.current = m.label === label);
+    model().vision = data.vision;
+    status(`${label} · ${data.size.toLocaleString()} tokens${data.vision ? "" : " · text only"}`);
+  } catch (e) {
+    status(e.message, "bad");
+    if (model()) $("model").value = model().label;
+  }
+  $("model").disabled = false;
+  refresh();
+}
+
+// ---------- attachments ----------
+
+async function shrink(file) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#fff";  // transparent parts would reach the model as black
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/png").split(",")[1];
+}
+
+async function addFiles(files) {
+  const sees = model()?.vision;
+  for (const file of files) {
+    const name = file.name || "pasted image";
+    try {
+      if (file.type.startsWith("image/")) {
+        if (!sees) { note(`${name}: this model can't read images`, "bad"); continue; }
+        attachments.push({name, kind: "image", data: await shrink(file)});
+      } else if (file.type === "application/pdf" || /\.pdf$/i.test(name)) {
+        const response = await fetch("/pdf", {method: "POST", body: file});
+        const pdf = await response.json();
+        if (!response.ok) throw new Error(pdf.error);
+        if (pdf.text) attachments.push({name, kind: "text", data: pdf.text});
+        if (sees) pdf.images.forEach(p => attachments.push({name: `${name} p.${p.page}`, kind: "image", data: p.data}));
+        else if (pdf.images.length) note(`${name}: ${pdf.images.length} scanned page(s) left out; this model can't read images`, "bad");
+        if (pdf.note) note(`${name}: ${pdf.note}`);
+        if (!pdf.text && !pdf.images.length) note(`${name}: no text found`, "bad");
+      } else if (/\.docx$/i.test(name)) {
+        const response = await fetch("/docx", {method: "POST", body: file});
+        const docx = await response.json();
+        if (!response.ok) throw new Error(docx.error);
+        if (docx.text) attachments.push({name, kind: "text", data: docx.text});
+        else note(`${name}: no text found`, "bad");
+      } else {
+        const text = await file.text();
+        if (text.includes("\0")) throw new Error("not a text file");
+        attachments.push({name, kind: "text", data: text});
+      }
+    } catch (e) {
+      note(`${name}: ${e.message}`, "bad");
+    }
+  }
+  refresh();
+}
+
+function chip(attachment, remove) {
+  const element = document.createElement("span");
+  element.className = "chip";
+  if (attachment.kind === "image") {
+    const img = document.createElement("img");
+    img.src = "data:image/png;base64," + attachment.data;
+    element.append(img);
+  }
+  const name = document.createElement("span");
+  name.textContent = attachment.name;
+  name.title = attachment.name;
+  element.append(name);
+  if (remove) {
+    const x = document.createElement("button");
+    x.textContent = "✕";
+    x.title = "Remove";
+    x.onclick = remove;
+    element.append(x);
+  }
+  return element;
+}
+
+// ---------- the log ----------
+
+function status(text, kind) {
+  $("status").textContent = text;
+  $("status").style.color = kind === "bad" ? "var(--bad)" : "";
+}
+
+function scrollDown() { $("log").scrollTop = $("log").scrollHeight; }
+
+function note(text, kind = "") {
+  const element = document.createElement("div");
+  element.className = `note ${kind}`;
+  element.textContent = text;
+  $("messages").append(element);
+  scrollDown();
+}
+
+function showUser(text, files) {
+  const element = document.createElement("div");
+  element.className = "msg user";
+  if (files.length) {
+    const row = document.createElement("div");
+    row.className = "files";
+    row.append(...files.map(f => chip(f)));
+    element.append(row);
+  }
+  const pre = document.createElement("pre");
+  pre.textContent = text;
+  element.append(pre);
+  $("messages").append(element);
+  scrollDown();
+}
+
+// For an ASCII answer: the diagram without the ``` fence around it.
+const unfence = text => text.replace(/^\s*```[^\n]*\n/, "").replace(/\n?```\s*$/, "");
+
+function showAnswer(ascii) {
+  const element = document.createElement("div");
+  element.className = "msg answer" + (ascii ? " ascii" : "");
+  const pre = document.createElement("pre");
+  const copy = document.createElement("button");
+  copy.className = "copy";
+  copy.textContent = "Copy";
+  copy.onclick = async () => {
+    await navigator.clipboard.writeText(pre.textContent);
+    copy.textContent = "Copied";
+    setTimeout(() => copy.textContent = "Copy", 1200);
+  };
+  element.append(pre, copy);
+  $("messages").append(element);
+  return text => {  // null removes the answer again: none came
+    if (text === null) return element.remove();
+    pre.textContent = ascii ? unfence(text) : text;
+    scrollDown();
+  };
+}
+
+// ---------- asking ----------
+
+// Stream an answer to messages into show(text), then show(null) if none came.
+// Returns its text (cut short if stopped), or null.
+async function ask(messages, show) {
+  controller = new AbortController();
+  stopped = false;
+  refresh();
+  let text = "";
+  try {
+    const response = await fetch("/chat", {method: "POST", body: JSON.stringify({messages}),
+                                           signal: controller.signal});
+    if (!response.ok) throw new Error((await response.json()).error);
+    const dropped = +response.headers.get("X-Dropped");
+    if (dropped) note(`${dropped} earlier message(s) left out to fit the context window`);
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      text += value;
+      show(text.split("\0")[0]);
+    }
+    const [answer, error] = text.split("\0");
+    text = answer;
+    if (error !== undefined) note(error, "bad");
+  } catch (e) {
+    if (e.name !== "AbortError") note(e.message, "bad");
+  }
+  controller = null;
+  refresh();
+  text = text.trimEnd();
+  show(text || null);
+  return text || null;
+}
+
+async function send() {
+  const typed = $("input").value.trim();
+  if (controller || (!typed && !attachments.length)) return;
+  const texts = attachments.filter(a => a.kind === "text").map(a => `--- ${a.name} ---\n${a.data}`);
+  const images = attachments.filter(a => a.kind === "image").map(a => a.data);
+  const message = {role: "user", content: [...texts, typed].join("\n\n").trim()};
+  if (images.length) message.images = images;
+  showUser(typed, attachments);
+  attachments = [];
+  $("input").value = "";
+  history.push(message);
+  const answer = await ask(history, showAnswer(false));
+  if (answer === null) history.pop();  // keep the history alternating: user, answer, user, ...
+  else history.push({role: "assistant", content: answer});
+}
+
+async function ascii() {
+  const images = attachments.filter(a => a.kind === "image");
+  if (controller || !images.length) return;
+  attachments = attachments.filter(a => a.kind !== "image");
+  for (const image of images) {
+    showUser("ASCII diagram", [image]);
+    // Only this image goes to the model, so earlier images are not processed again.
+    const message = {role: "user", content: ASCII_PROMPT, images: [image.data]};
+    const answer = await ask([message], showAnswer(true));
+    if (answer !== null) history.push(message, {role: "assistant", content: answer});
+    if (stopped) break;
+  }
+}
+
+function refresh() {
+  const busy = controller !== null;
+  const chips = $("chips");
+  chips.replaceChildren(...attachments.map((a, i) => chip(a, () => { attachments.splice(i, 1); refresh(); })));
+  $("send").hidden = busy;
+  $("stop").hidden = !busy;
+  $("model").disabled = busy || !models.length;
+  $("ascii").disabled = busy || !model()?.vision || !attachments.some(a => a.kind === "image");
+  $("input").style.height = "auto";
+  $("input").style.height = $("input").scrollHeight + 2 + "px";
+}
+
+// ---------- events ----------
+
+$("model").onchange = e => choose(e.target.value);
+$("new").onclick = () => { history = []; $("messages").replaceChildren(); };
+$("attach").onclick = () => $("file").click();
+$("file").onchange = e => { addFiles([...e.target.files]); e.target.value = ""; };
+$("send").onclick = send;
+$("ascii").onclick = ascii;
+$("stop").onclick = () => { stopped = true; controller?.abort(); };
+$("input").oninput = refresh;
+$("input").onkeydown = e => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+};
+document.onpaste = e => {
+  const files = [...e.clipboardData.files];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+};
+document.ondragover = e => { e.preventDefault(); document.body.classList.add("drop"); };
+document.ondragleave = e => { if (!e.relatedTarget) document.body.classList.remove("drop"); };
+document.ondrop = e => {
+  e.preventDefault();
+  document.body.classList.remove("drop");
+  addFiles([...e.dataTransfer.files]);
+};
+
+loadModels();
+</script>
+</body>
+</html>
