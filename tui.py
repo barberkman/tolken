@@ -415,10 +415,7 @@ def matching(files, word, limit=8):
 
 
 class Prompt(TextArea):
-    """The input box. Enter sends; Shift+Enter or Ctrl+J starts a new line.
-
-    A multi-line paste is kept whole and shown as a short marker.
-    """
+    """The input box. Enter sends; Shift+Enter or Ctrl+J starts a new line."""
 
     BINDINGS = [
         Binding("up", "choose(-1)", show=False),
@@ -431,7 +428,7 @@ class Prompt(TextArea):
 
     def __init__(self, placeholder):
         super().__init__(placeholder=placeholder, highlight_cursor_line=False)
-        self.pastes = {}  # marker in the input -> the pasted text
+        self.pastes = {}  # marker in the input -> the path of the file attached
 
     @property
     def value(self):
@@ -470,25 +467,24 @@ class Prompt(TextArea):
 
     def on_paste(self, event):
         event.stop()  # handled here; otherwise it would travel on to the app and come back a second time
-        files, lines = dropped(event.text), event.text.splitlines()
+        files = dropped(event.text)
         if files:  # what a drag and drop pastes: the files' paths
             event.prevent_default()
             for path in files:
                 self.attach(path)
-        elif len(lines) > 1:
-            event.prevent_default()  # TextArea itself would insert all the lines
-            marker = f"[pasted {len(lines)} lines #{len(self.pastes) + 1}]"
-            self.pastes[marker] = event.text
-            self.insert(marker)
 
     def on_text_area_changed(self, event):
-        """Attach the file of a quoted path typed into the input: Terminator types one for a pasted image or a drop."""
+        """Attach the file of a quoted path just typed into the input: Terminator types one for a pasted image or a drop.
+
+        Only a path that ends at the cursor, so that one inside pasted text stays text.
+        """
+        cursor = self.document.get_index_from_location(self.cursor_location)
         for match in TYPED_PATH.finditer(self.text):
             path = match[1].replace("''", "'")
-            if os.path.isfile(path):
+            if match.end() == cursor and os.path.isfile(path):
                 start, end = (self.document.get_location_from_index(index) for index in match.span())
                 self.replace(self.marker_for(path) + match[2], start, end)  # the space after it, if typed yet
-                return  # replacing is a change too, which attaches the next path
+                return
 
     def attach(self, path):
         """Put a short marker for a file in the input; take() turns it into a pin of the file."""
@@ -499,17 +495,14 @@ class Prompt(TextArea):
         marker = f"[{'image' if tolken.kind(path) == 'image' else 'file'} {os.path.basename(path)}]"
         if marker in self.pastes:
             marker = f"{marker[:-1]} #{len(self.pastes) + 1}]"
-        self.pastes[marker] = (os.path.abspath(path),)  # a tuple: a file, where a pasted text is a string
+        self.pastes[marker] = os.path.abspath(path)
         return marker
 
     def take(self):
-        """Empty the input; return the message as typed and with pasted text and attached files put back in."""
+        """Empty the input; return the message as typed and with attached files put back in."""
         typed = message = self.value.strip()
-        for marker, text in self.pastes.items():
-            if isinstance(text, tuple):
-                message = message.replace(marker, f'@"{text[0]}"')
-            else:
-                message = message.replace(marker, "\n" + text.strip("\n") + "\n")
+        for marker, path in self.pastes.items():
+            message = message.replace(marker, f'@"{path}"')
         self.value, self.pastes = "", {}
         return typed, message.strip()
 
@@ -1048,8 +1041,8 @@ class TolkenApp(App):
                 self.prompt.attach(path)
         elif held[0] == "image":
             self.prompt.attach(save_image(held[1]))
-        elif dropped(held[1]) or len(held[1].splitlines()) > 1:
-            self.prompt.post_message(events.Paste(held[1]))  # as a paste: attached files, or a marker
+        elif dropped(held[1]):
+            self.prompt.post_message(events.Paste(held[1]))  # as a paste, which attaches the files
         else:
             self.prompt.insert(held[1])
 

@@ -448,7 +448,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(prompt.value, "[file a.txt] ")
                 await pilot.press("alt+v")
                 self.assertRegex(prompt.value, r"^\[file a\.txt\] \[image clipboard-\d{8}-\d{6}\.png\] $")
-                saved = next(value[0] for marker, value in prompt.pastes.items() if marker.startswith("[image"))
+                saved = next(path for marker, path in prompt.pastes.items() if marker.startswith("[image"))
                 self.addCleanup(os.remove, saved)
                 with open(saved, "rb") as f:
                     self.assertEqual(f.read(), b"\x89PNG fake")
@@ -513,20 +513,29 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.prompts[1], "--- a.txt (lines 1-1 of 1) ---\none\n\n" + failure + "\n" + tolken.GO_ON)
             self.assertEqual(len(self.app.query(".card")), 0)
 
-    async def test_multi_line_paste_is_sent_whole(self):
+    async def test_a_multi_line_paste_is_shown_whole(self):
         self.answers = ["ok"]
         async with self.app.run_test() as pilot:
             prompt = self.app.query_one(tui.Prompt)
-            prompt.post_message(events.Paste("zzz one"))
+            prompt.post_message(events.Paste("zzz one "))
             await pilot.pause()
-            self.assertEqual(prompt.value, "zzz one")
+            self.assertEqual(prompt.value, "zzz one ")
             prompt.post_message(events.Paste("error: line 1\n  at line 2\nline 3\n"))
             await pilot.pause()
-            self.assertEqual(prompt.value, "zzz one[pasted 3 lines #1]")
+            self.assertEqual((prompt.value, prompt.pastes), ("zzz one error: line 1\n  at line 2\nline 3\n", {}))
             await pilot.press("enter")
             await self.until(pilot, lambda: not self.app.busy)
-            self.assertEqual(self.items()[0], "> zzz one[pasted 3 lines #1]")
-            self.assertTrue(self.prompts[0].endswith("zzz one\nerror: line 1\n  at line 2\nline 3"))
+            self.assertEqual(self.items()[0], "> zzz one error: line 1\n  at line 2\nline 3")
+            self.assertTrue(self.prompts[0].endswith("zzz one error: line 1\n  at line 2\nline 3"))
+
+    async def test_a_quoted_path_in_pasted_text_stays_text(self):
+        write("a.txt", "x\n")
+        text = f"Get-Content '{os.path.abspath('a.txt')}'\nWrite-Host done"
+        async with self.app.run_test() as pilot:
+            prompt = self.app.prompt
+            prompt.post_message(events.Paste(text))
+            await pilot.pause()
+            self.assertEqual((prompt.value, prompt.pastes), (text, {}))
 
     async def type(self, pilot, text):
         await pilot.press(*("space" if character == " " else character for character in text))
@@ -641,22 +650,6 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await press("down", "zzz look at @a.py")
             await press("down", "draft")
             await press("down", "draft")
-
-    async def test_a_recalled_message_keeps_its_pasted_text(self):
-        self.answers = ["one", "two"]
-        async with self.app.run_test() as pilot:
-            prompt = self.app.prompt
-            await self.type(pilot, "zzz ")
-            prompt.post_message(events.Paste("line 1\nline 2\n"))
-            await pilot.pause()
-            await pilot.press("enter")
-            await self.until(pilot, lambda: not self.app.busy)
-            await pilot.press("up")
-            self.assertEqual(prompt.value, "zzz [pasted 2 lines #1]")
-            await pilot.press("enter")
-            await self.until(pilot, lambda: not self.app.busy)
-            self.assertTrue(self.prompts[0].endswith("zzz \nline 1\nline 2"))
-            self.assertEqual(self.prompts[1], "zzz \nline 1\nline 2")  # the paste was sent again, whole
 
     async def test_model_list_switches_the_model(self):
         small = FakeModel("small")
