@@ -27,6 +27,8 @@ A file dragged onto the window (its path pasted) is attached, as [file name]
 in the input: a PDF or Word file goes to the model as its text, an image to a
 model that can see. Alt+V attaches the files copied in Explorer, or an image
 on the clipboard (saved to a temporary folder), and pastes text as usual.
+A file whose full path is typed in single quotes is attached the same way:
+that is what Terminator types for an image pasted with Ctrl+V, or a file dropped.
 While a message is answered, a random Middle-earth phrase is shown above the input,
 with the tokens streamed so far and the speed of the current call.
 """
@@ -244,6 +246,10 @@ def dropped(text):
         return [whole]
     paths = [quoted or bare for quoted, bare in re.findall(r'"([^"]+)"|(\S+)', text)]
     return paths if paths and all(os.path.isfile(path) for path in paths) else []
+
+
+# An absolute Windows path in single quotes, '' standing for a quote, as PowerShell quotes it; maybe a space after.
+TYPED_PATH = re.compile(r"'((?:[A-Za-z]:\\|\\\\)(?:[^'\n]|'')+)'( ?)")
 
 
 def save_image(png):
@@ -470,13 +476,26 @@ class Prompt(TextArea):
             self.pastes[marker] = event.text
             self.insert(marker)
 
+    def on_text_area_changed(self, event):
+        """Attach the file of a quoted path typed into the input: Terminator types one for a pasted image or a drop."""
+        for match in TYPED_PATH.finditer(self.text):
+            path = match[1].replace("''", "'")
+            if os.path.isfile(path):
+                start, end = (self.document.get_location_from_index(index) for index in match.span())
+                self.replace(self.marker_for(path) + match[2], start, end)  # the space after it, if typed yet
+                return  # replacing is a change too, which attaches the next path
+
     def attach(self, path):
         """Put a short marker for a file in the input; take() turns it into a pin of the file."""
+        self.insert(self.marker_for(path) + " ")
+
+    def marker_for(self, path):
+        """A new marker for a file, [image name] or [file name], remembered with the file's path."""
         marker = f"[{'image' if tolken.kind(path) == 'image' else 'file'} {os.path.basename(path)}]"
         if marker in self.pastes:
             marker = f"{marker[:-1]} #{len(self.pastes) + 1}]"
         self.pastes[marker] = (os.path.abspath(path),)  # a tuple: a file, where a pasted text is a string
-        self.insert(marker + " ")
+        return marker
 
     def take(self):
         """Empty the input; return the message as typed and with pasted text and attached files put back in."""

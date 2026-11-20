@@ -358,6 +358,25 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             prompt.insert("what is in it?")
             self.assertEqual(prompt.take(), ("[file my spec.pdf] what is in it?", f'@"{path}" what is in it?'))
 
+    async def test_a_quoted_path_typed_in_is_attached(self):
+        # What Terminator types for an image pasted with Ctrl+V, or for files dropped: PowerShell-quoted paths.
+        for name in ("x.png", "b.txt", "it's.png"):
+            write(name, "x")
+        x, b, quote = (os.path.abspath(name) for name in ("x.png", "b.txt", "it's.png"))
+        async with self.app.run_test() as pilot:
+            prompt = self.app.prompt
+            for character in f"'{x}' '{b}' '{quote.replace(chr(39), chr(39) * 2)}' ":
+                prompt.insert(character)
+                await pilot.pause()
+            self.assertEqual(prompt.value, "[image x.png] [file b.txt] [image it's.png] ")
+            prompt.insert("what is it?")
+            self.assertEqual(prompt.take()[1], f'@"{x}" @"{b}" @"{quote}" what is it?')
+            for text in ("'README.md' ", f"'{os.path.abspath('missing.png')}' ", f"'{x}"):
+                prompt.insert(text)
+                await pilot.pause()
+                self.assertEqual(prompt.value, text)
+                prompt.value = ""
+
     async def test_alt_v_attaches_copied_files_and_images_and_pastes_text(self):
         write("a.txt", "x\n")
         held = [("files", [os.path.abspath("a.txt")]), ("image", b"\x89PNG fake"), ("text", "hello"), None]
