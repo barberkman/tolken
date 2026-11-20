@@ -165,8 +165,14 @@ NO_CODE = "(No file contents have been shown yet.)"  # stands where the code wou
 GO_ON = ("Continue the task. The latest copy of each file above, with the changed parts shown after it, "
          "is as it is now. If the task is finished, reply with only DONE.")  # follows the results of the model's edits
 
-BLOCK = re.compile(  # the path line is left out when a block follows another one for the same file
-    r"^(?:([^\n]+)\n+)?(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n(.*?)^={5,9}[ \t]*\n(.*?)^>{5,9} REPLACE",
+# The path line is left out when a block follows another one for the same file. A block's text never runs
+# past the next <<<<<<< SEARCH line, so a block left open is dropped, not run into the next one. Small
+# models often end a block with a second ======= line; it is taken for the end when no >>>>>>> REPLACE
+# comes before the next block or the end of the answer.
+BLOCK = re.compile(
+    r"^(?:([^\n]+)\n+)?(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n((?:(?!^<{5,9} SEARCH).)*?)^={5,9}[ \t]*\n"
+    r"((?:(?!^<{5,9} SEARCH).)*?)"
+    r"(?:^>{5,9} REPLACE|^={5,9}[ \t]*$(?=(?:(?!^<{5,9} SEARCH|^>{5,9} REPLACE).)*(?:\Z|^<{5,9} SEARCH)))",
     re.S | re.M)
 LABEL = re.compile(r"^(?:file(?:[ _]?(?:path|name))?|path)\s*[:=]\s*", re.I)  # "FILE:" before a block's path
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)

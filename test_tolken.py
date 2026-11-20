@@ -213,6 +213,28 @@ class Edits(InTempDir):
                                                       ("b.py", "x", "y"), ("b.py", "p", "q")])
         self.assertEqual(tolken.parse_edits(block.format("one", "1")), [("", "one", "1")])  # no file named at all
 
+    def test_a_block_left_open_is_dropped_and_not_run_into_the_next(self):
+        good = "FILE: b.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n"
+        for broken in ("FILE: a.py\n<<<<<<< SEARCH\nold\n=======\nnew\n",  # no end
+                       "FILE: a.py\n<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n"):  # no =======
+            self.assertEqual(tolken.parse_edits(broken + good), [("b.py", "x", "y")], broken)
+        write("a.py", "old\n")
+        write("b.py", "x\n")
+        session = tolken.Session(mock.Mock())
+        session.approve = "auto"
+        self.assertEqual(session.apply(broken + good), ({"b.py": "applied"}, [
+            "1 edit block(s) could not be read and were ignored; a block ends with >>>>>>> REPLACE"], [], None))
+        self.assertEqual((read_bytes("a.py"), read_bytes("b.py")), (b"old\n", b"y\n"))
+
+    def test_a_second_divider_ends_a_block_that_has_no_end_marker(self):
+        answer = ("FILE: a.py\n<<<<<<< SEARCH\none\n=======\n1\n=======\n"
+                  "FILE: b.py\n<<<<<<< SEARCH\ntwo\n=======\n2\n=======")
+        self.assertEqual(tolken.parse_edits(answer), [("a.py", "one", "1"), ("b.py", "two", "2")])
+
+    def test_a_divider_line_in_the_new_text_is_kept_when_the_block_ends_with_its_marker(self):
+        answer = "FILE: a.md\n<<<<<<< SEARCH\nTitle\n=======\nHeading\n=======\ntext\n>>>>>>> REPLACE\n"
+        self.assertEqual(tolken.parse_edits(answer), [("a.md", "Title", "Heading\n=======\ntext")])
+
     def test_block_path_drops_labels_and_marks(self):
         for line in ("src/a.py", "FILE: src/a.py", "**File path:** `src/a.py`", "FILE_PATH: src\\a.py",
                      "### path = src/a.py", "`src/a.py`:"):
