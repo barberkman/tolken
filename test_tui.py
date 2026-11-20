@@ -155,11 +155,14 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await self.submit(pilot, "zzz first")
             await self.until(pilot, lambda: "A long" in self.items())
             self.assertTrue(flavor.display)
-            line = re.fullmatch(r"✦ (.+…) \(↓ 1 token\)", str(flavor.content))  # one piece is about a token
+            line = re.fullmatch(r"[◯O∣] (.+…) \(↓ 1 token\)", str(flavor.content))  # one piece is about a token
             self.assertIn(line[1], tui.PHRASES)  # and too soon for a speed
             self.app.call_first -= 2  # as if the first piece came two seconds before the last
+            self.app.phrase_since -= 10  # and the phrase was shown ten seconds ago
             await pilot.pause(0.15)
             self.assertRegex(str(flavor.content), r"\(↓ 1 token · \d+ tok/s\)$")
+            self.assertIn(self.app.phrase, tui.PHRASES)
+            self.assertNotEqual(self.app.phrase, line[1])  # a new phrase every ten seconds
             self.assertTrue(self.status().startswith("answering · "))  # the status bar keeps its text
             self.hold.set()
             await self.until(pilot, lambda: not self.app.busy)
@@ -645,6 +648,31 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.items()[2:4], ["Let me see.", "The answer."])
                 self.assertEqual(len(self.app.query(".thinking")), 1)
                 self.assertEqual(self.app.session.history[-1][1], "The answer.")  # the thinking is not carried forward
+
+    async def test_runes_flicker_above_the_input_while_thinking(self):
+        thought, answered = threading.Event(), threading.Event()
+
+        def chat(messages, url, ui, session, size=None, think=None):
+            ui.thinking("Let me see.")
+            thought.wait(5)
+            ui.text("The answer.")
+            answered.wait(5)
+            ui.text("\n")
+            return "The answer."
+
+        with mock.patch.object(tolken, "chat", chat):
+            async with self.app.run_test() as pilot:
+                flavor = self.app.query_one("#flavor")
+                await self.submit(pilot, "zzz hi")
+                await self.until(pilot, lambda: self.app.activity == "thinking")
+                await pilot.pause(0.15)
+                self.assertRegex(str(flavor.content), r"^[◯O∣] .+… [ᚠ-ᛟ]{8} \(↓ 1 token")
+                thought.set()
+                await self.until(pilot, lambda: self.app.activity == "answering")
+                await pilot.pause(0.15)
+                self.assertRegex(str(flavor.content), r"^[◯O∣] [^ᚠ-ᛟ]+$")  # the runes are gone with the answer
+                answered.set()
+                await self.until(pilot, lambda: not self.app.busy)
 
     async def test_model_by_name_unknown_name_and_failed_load(self):
         small, broken = FakeModel("small"), FakeModel("broken", fail=True)

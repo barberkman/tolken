@@ -68,7 +68,7 @@ DELETE_KEYS = "enter delete · esc keep"
 RUN_KEYS = "enter run · esc refuse"
 OUTPUT_LINES = 12  # lines of a command's output shown in its card (the model gets more)
 NEWLINE_KEYS = ("shift+enter", "ctrl+j")  # Shift+Enter only where the terminal reports it; Ctrl+J everywhere
-PHRASES = (  # shown above the input while the model works, one picked at random per message
+PHRASES = (  # shown above the input while the model works, in shuffled order, a new one every 10 seconds
     "Consulting the Palantír…", "Riddling in the dark…", "Pondering the Red Book…", "Smoking pipe-weed on it…",
     "Entmooting…", "Lighting the beacons…", "Speaking friend and entering…", "Delving too greedily and too deep…",
     "Tracking like a Ranger…", "Seeking the Arkenstone…", "Saddling Shadowfax…", "Waking the Ents…",
@@ -84,6 +84,8 @@ PHRASES = (  # shown above the input while the model works, one picked at random
     "Decoding the runes…", "Embedding Elvish runes…", "Attending to every token…", "Prompting the Ents…",
     "Raising the temperature of Mount Doom…", "Hallucinating a second breakfast…", "Unrolling the map of Middle-earth…",
 )
+RING = "◯O∣O"  # a ring turning on its axis: face on, tilted, edge on, tilted; shown before the phrase
+RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛜᛞᛟ"  # the Elder Futhark; a few flicker after the phrase while the model thinks
 
 
 def shift_held():
@@ -565,7 +567,8 @@ class TolkenApp(App):
         self.started = self.call_started = 0.0
         self.calls, self.call_timings = 0, []
         self.hint_text, self.hint_until = "", 0.0  # a short message in the status bar, and when it expires
-        self.phrase = self.last_phrase = ""  # the phrase shown while working ("" when idle), and the one shown last
+        self.phrase, self.phrase_since = "", 0.0  # the phrase shown while working ("" when idle), and since when
+        self.deck = []  # phrases not yet shown in this round through all of them
         self.generated = 0  # pieces (each about a token) of thinking and answer streamed for this message
         self.call_from = 0  # self.generated when the current call started
         self.call_first = self.call_last = 0.0  # when the current call's first and latest pieces arrived
@@ -692,11 +695,19 @@ class TolkenApp(App):
     def tick(self):
         """Runs ten times a second: show new answer text, the phrase above the input, and refresh the status bar."""
         self.flush()
+        now = time.monotonic()
         if not self.busy:
             self.phrase, self.generated = "", 0
-        elif not self.phrase:  # a message (or a model load) has started: pick a phrase for it
-            self.phrase = self.last_phrase = random.choice([p for p in PHRASES if p != self.last_phrase])
-        line = "✦ " + self.phrase
+        elif not self.phrase or now - self.phrase_since >= 10:  # a message has started, or the phrase is old
+            if not self.deck:
+                self.deck = random.sample(PHRASES, len(PHRASES))
+                if self.deck[-1] == self.phrase:  # the new round would start with the phrase shown now
+                    self.deck.reverse()
+            self.phrase, self.phrase_since = self.deck.pop(), now
+        frame = int(now * 4)  # four frames a second: the ring turns once a second
+        line = RING[frame % len(RING)] + " " + self.phrase
+        if self.activity == "thinking":
+            line += " " + "".join(random.Random(frame).choices(RUNES, k=8))
         if self.generated:
             line += f" (↓ {self.generated:,} token{'s' * (self.generated != 1)}"
             if self.call_last - self.call_first >= 1:  # streamed long enough for a steady speed
