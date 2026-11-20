@@ -59,10 +59,13 @@ Edits are applied as each answer arrives, once the user confirms them. The
 model is then called again, and told how its edits went, unless it ended the
 answer with a DONE line; it is also called again when it ends with a CONTINUE
 line, asks for files, an edit could not be applied, or its answer was cut off
-at max_out. It stops when the user declines an edit, when two answers in a row
-change nothing, when the window is full and an answer changes nothing, or after
-MAX_CALLS calls. What the model was not told then (an edit declined or undone,
-one that failed, a command's output) comes before the next message.
+at max_out. The user answers a change or a command with yes, no, or what to do
+instead; after a no, the rest of that answer is not asked about or made. With
+what to do instead, the model is called again at once and told it. It stops
+when the user just says no, when two answers in a row change nothing, when the
+window is full and an answer changes nothing, or after MAX_CALLS calls. What
+the model was not told then (an edit declined or undone, one that failed, a
+command's output) comes before the next message.
 
 The model runs a command (to build or test) with a "RUN: command" line, after
 its edits are made. It runs without a shell (shell syntax is refused, since a
@@ -506,7 +509,7 @@ def search(question, budget, files=None):
 class Plain:
     """Shows tolken's output with print() and asks with input().
 
-    The full-screen interface (tui.py) provides the same methods, apart from yes().
+    The full-screen interface (tui.py) provides the same methods, apart from answer().
     """
 
     thought = False  # thinking text was printed last, so the answer starts on a new line
@@ -542,24 +545,30 @@ class Plain:
             print("\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), path, path, lineterm="")))
 
     def confirm(self, path, old, new):
-        """Show how a file's text would change and ask whether to apply it. new is None for deleting the file."""
+        """Show how a file's text would change and ask whether to apply it. new is None for deleting the file.
+
+        Returns True (yes), False (no) or the user's comment (a no, with what to do instead).
+        """
         self.show(path, old, new)
-        return self.yes(f"Delete {path}? [y/N] " if new is None else f"Apply to {path}? [y/N] ")
+        return self.answer(f"Delete {path}? [y/N, or what to do instead] " if new is None
+                           else f"Apply to {path}? [y/N, or what to do instead] ")
 
     def allow(self, command):
-        """Ask whether to run a command the model wants to run."""
-        return self.yes(f"Run {command}? [y/N] ")
+        """Ask whether to run a command the model wants to run. Returns what confirm() does."""
+        return self.answer(f"Run {command}? [y/N, or what to do instead] ")
 
     def ran(self, command, code, seconds, output):
         """Show the output of a command that ran; code is None when it was stopped for taking too long."""
         print(clip(output, RUN_CHARS))
 
-    def yes(self, question):
+    def answer(self, question):
+        """y: True; n, no or nothing: False; any other text: the user's comment (a no, with what to do instead)."""
         try:
-            return input(question).strip().lower() == "y"
+            answer = input(question).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
+        return True if answer.lower() == "y" else False if answer.lower() in ("", "n", "no") else answer
 
 
 PLAIN = Plain()
@@ -1029,20 +1038,33 @@ def edit_problem(text, old):
             + "\n".join(nearest))
 
 
+def verdict(answer):
+    """A ui's answer to a question: True (yes), False (no), or the user's comment (a no, with what to do instead)."""
+    if isinstance(answer, str):
+        return answer.strip() or False
+    return bool(answer)
+
+
+def refusal(note, comment):
+    """The note about a change or command the user said no to, with what they said instead, if anything."""
+    return f"{note}. Instead, the user said: {comment}" if comment else note
+
+
 def approved(ui, path, old, new, auto):
-    """Whether to make a change: the user's answer, or with auto (the "auto" mode) yes, once it is shown."""
+    """Whether to make a change: the user's answer (see verdict), or with auto (the "auto" mode) True, once shown."""
     if auto:
         ui.show(path, old, new)
         return True
-    return ui.confirm(path, old, new)
+    return verdict(ui.confirm(path, old, new))
 
 
 def edit_file(path, blocks, ui=PLAIN, auto=False):
     """Apply (search, replace) blocks to one file after showing the diff and asking (with auto, not asking).
 
     Returns (done, problems): done is True when applied, False when the user
-    declined, None when there was nothing to ask about; problems are the notes
-    about blocks that could not be applied.
+    declined, the user's comment when they declined with one, None when there
+    was nothing to ask about; problems are the notes about blocks that could
+    not be applied.
     """
     problems = []
 
@@ -1073,14 +1095,15 @@ def edit_file(path, blocks, ui=PLAIN, auto=False):
             new = result
     if new == old:
         return None, problems
-    if approved(ui, path, old, new, auto):
+    answer = approved(ui, path, old, new, auto)
+    if answer is True:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(new.replace("\n", "\r\n") if "\r\n" in raw else new)
         ui.note(f"applied {path}", "good")
         return True, problems
     ui.note(f"skipped {path}")
-    return False, problems
+    return answer, problems
 
 
 def raw_bytes(path):
@@ -1121,13 +1144,14 @@ def delete_file(path, ui=PLAIN, auto=False):
         problem = f"could not delete {path}: it is outside the project folder"
     elif not os.path.isfile(path):
         problem = f"could not delete {path}: there is no such file"
-    elif approved(ui, path, read_text(path, "replace").replace("\r\n", "\n"), None, auto):
-        os.remove(path)
-        ui.note(f"deleted {path}", "good")
-        return True, []
     else:
+        answer = approved(ui, path, read_text(path, "replace").replace("\r\n", "\n"), None, auto)
+        if answer is True:
+            os.remove(path)
+            ui.note(f"deleted {path}", "good")
+            return True, []
         ui.note(f"kept {path}")
-        return False, []
+        return answer, []
     ui.note(problem, "bad")
     return None, [problem]
 
@@ -1326,9 +1350,10 @@ class Session:
 
         The model is called again while it asks for files that are not shown, made
         changes without ending with DONE, ends with CONTINUE, an edit could not be
-        applied, or its answer was cut off. It stops when the user declines an
-        edit, the window is full and an answer changed nothing, two answers in a
-        row neither changed a file nor brought in a new one, or after MAX_CALLS calls.
+        applied, its answer was cut off, or the user said what to do instead of a
+        change or command. It stops when the user just says no to one, the window
+        is full and an answer changed nothing, two answers in a row neither changed
+        a file nor brought in a new one, or after MAX_CALLS calls.
 
         Each call continues the conversation of the call before while it fits the
         window (see compose()); the budgets below are for a prompt built afresh.
@@ -1421,12 +1446,13 @@ class Session:
                 return
             if self.stopped:
                 break
-            changed, problems, declined = self.apply(answer)
+            changed, problems, declined, comment = self.apply(answer)
             if self.cut:  # the model is called again for the rest
                 problems.append(f"your answer was cut off at the length limit ({answer_room(size):,} tokens); the "
                                 "complete edit blocks in it were handled. Give the rest in the next answer, a file "
                                 "or two at a time.")
-            ran, refused = ([], []) if declined else self.run(answer)  # after the edits, which it may test
+            # After the edits, which it may test; none after a change the user said no to.
+            ran, refused, comment = ([], [], comment) if declined else self.run(answer)
             declined += refused
             report = [f"{done} {path}" for path, done in changed.items()] + problems + ran + declined
             # Kept for the next message unless a call of this one tells it; only what the model cannot assume.
@@ -1441,12 +1467,12 @@ class Session:
             wanted = self.visible([entry for entry in requested(answer, files) if entry not in self.ctx])
             prose = BLOCK.sub("", answer)  # so that code in an edit, such as a continue statement, is no marker
             more = CONTINUE.search(prose) or bool(changed) and not DONE.search(prose)
-            idle = 0 if changed or wanted else idle + 1
+            idle = 0 if changed or wanted or comment else idle + 1
             crowded = full or shown != before  # the window is full: going on is worth it only while files change
-            if declined or crowded and not changed or idle == 2 or call == MAX_CALLS \
-                    or not (wanted or more or problems or ran):
+            if call == MAX_CALLS or not comment and (declined or crowded and not changed or idle == 2
+                                                     or not (wanted or more or problems or ran)):
                 break  # the user stepped in, nothing is happening, it has gone on long enough, or the model is done
-            if changed or problems or more or ran:
+            if changed or problems or more or ran or comment:
                 # Tell the model how its edits and commands went, and show it the files it changed or tried to.
                 record(answer)
                 earlier = [path for path in progress if path not in changed]
@@ -1507,8 +1533,8 @@ class Session:
     def run(self, answer):
         """Run the commands an answer asks for. In "auto" an allowed one runs at once; any other waits for the user.
 
-        Returns (results, refused): what to tell the model about each command, and a note
-        about the command the user refused, if any (which ends the message, as declining an edit does).
+        Returns (results, refused, comment): what to tell the model about each command, a note
+        about the command the user refused, if any, and the user's answer to that one (see apply()).
         """
         ui, results = self.ui, []
 
@@ -1521,9 +1547,11 @@ class Session:
                 tell(f"could not run {command}: shell syntax (pipes, &, &&, ;, ^, %, redirection and "
                      "backquotes) cannot be used")
                 continue
-            if not (self.approve == "auto" and listed(command)) and not ui.allow(command):
-                ui.note(f"did not run {command}")
-                return results, [f"the user did not let {command} run"]
+            if not (self.approve == "auto" and listed(command)):
+                comment = verdict(ui.allow(command))
+                if comment is not True:
+                    ui.note(f"did not run {command}")
+                    return results, [refusal(f"the user did not let {command} run", comment)], comment
             ui.activity(f"running {command}")
             try:
                 code, seconds, output = run_command(command, self)
@@ -1537,17 +1565,22 @@ class Session:
                     else f"ran {command}: exit {code} in {seconds:.1f} s")
             ui.note(done, "good" if code == 0 else "warn")
             results.append(f"{done}\n{clip(output, RUN_CHARS * self.size // 8192)}")
-        return results, []
+        return results, [], None
 
     def apply(self, answer):
         """Make the edits and deletions an answer asks for, each once the user confirms it.
 
-        Returns (changed, problems, declined): changed maps each file edited or
-        deleted to "applied" or "deleted"; problems are the notes about what could
-        not be done; declined are the notes about what the user said no to.
+        The first change the user says no to is the last one asked about: the rest
+        of the answer may build on it, so the model gives them again.
+
+        Returns (changed, problems, declined, comment): changed maps each file edited
+        or deleted to "applied" or "deleted"; problems are the notes about what could
+        not be done; declined are the notes about what the user said no to; comment
+        is None when they said no to nothing, else False, or what they said instead.
         """
         ui, changed, problems, declined = self.ui, {}, [], []
         finished = []  # the files whose edits in this answer all applied
+        comment, left = None, []  # the user's no, and the changes after it, which are not asked about
 
         def problem(text):
             ui.note(text, "bad")
@@ -1561,7 +1594,9 @@ class Session:
             problem(f"{unread} edit block(s) could not be read and were ignored; a block ends with >>>>>>> REPLACE")
         removals = deletions(answer)
         for path, blocks in edits.items():
-            if not path:
+            if comment is not None:
+                left.append(path)
+            elif not path:
                 problem("could not apply an edit: the model did not say which file it is for")
             elif not inside(path):
                 problem(f"could not edit {path}: it is outside the project folder")
@@ -1572,22 +1607,29 @@ class Session:
                 before = raw_bytes(path), missing_folders(path)
                 done, said = edit_file(path, blocks, ui, self.approve == "auto")
                 problems += said
-                if done is False:
-                    declined.append(f"the user declined the edit to {path}; it was not applied")
-                if done:
+                if done is True:
                     changed[path] = "applied"
                     self.remember(path, *before)
                     if not said:
                         finished.append(path)
+                elif done is not None:
+                    comment = done
+                    declined.append(refusal(f"the user declined the edit to {path}; it was not applied", done))
         for path in dict.fromkeys(removals):
+            if comment is not None:
+                left.append(f"deleting {path}")
+                continue
             before = raw_bytes(path) if os.path.isfile(path) else None
             done, said = delete_file(path, ui, self.approve == "auto")
             problems += said
-            if done is False:
-                declined.append(f"the user kept {path}; it was not deleted")
-            if done:
+            if done is True:
                 changed[path] = "deleted"
                 self.remember(path, before, [])
+            elif done is not None:
+                comment = done
+                declined.append(refusal(f"the user kept {path}; it was not deleted", done))
+        if left:
+            declined.append(f"your later changes were not made either: {', '.join(left)}")
         # A deleted file can no longer be shown. The files whose edits all applied go first, in the order
         # they were finished, so that they are dropped first when the window is full: the files still to
         # be changed are worth more. A file this answer tried to edit is not finished unless it was again.
@@ -1597,7 +1639,7 @@ class Session:
         self.ctx = (sorted((entry for entry in kept if entry[0] in order), key=lambda entry: order[entry[0]])
                     + [entry for entry in kept if entry[0] not in order])
         self.pins = [entry for entry in self.pins if os.path.isfile(entry[0])]
-        return changed, problems, declined
+        return changed, problems, declined, comment
 
 
 # ---------- settings and startup ----------

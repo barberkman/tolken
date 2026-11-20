@@ -234,8 +234,8 @@ class Edits(InTempDir):
         outside = os.path.join(os.path.dirname(os.getcwd()), "zzz_outside.py").replace("\\", "/")
         inner = os.path.abspath("inner.py").replace("\\", "/")
         new = "FILE: {}\n<<<<<<< SEARCH\n=======\nx\n>>>>>>> REPLACE\n"
-        changed, problems, _ = tolken.Session(ui).apply(new.format("../up.py") + new.format(outside)
-                                                         + new.format(inner))
+        changed, problems, _, _ = tolken.Session(ui).apply(new.format("../up.py") + new.format(outside)
+                                                            + new.format(inner))
         self.assertEqual(problems, ["could not edit ../up.py: it is outside the project folder",
                                     f"could not edit {outside}: it is outside the project folder"])
         self.assertFalse(os.path.exists("../up.py") or os.path.exists(outside))
@@ -349,7 +349,7 @@ class Edits(InTempDir):
         write("a.txt", "one\ntwo\n")
         with mock.patch("builtins.input", return_value="n") as asked:
             tolken.delete_file("a.txt")
-        asked.assert_called_once_with("Delete a.txt? [y/N] ")
+        asked.assert_called_once_with("Delete a.txt? [y/N, or what to do instead] ")
         self.assertIn("a.txt: 2 lines", self.printed.getvalue())
         self.assertTrue(os.path.exists("a.txt"))
         with mock.patch("builtins.input", return_value="y"):
@@ -378,7 +378,7 @@ class Edits(InTempDir):
                   "FILE: new.txt\n<<<<<<< SEARCH\n=======\nfresh\n>>>>>>> REPLACE\n"
                   "DELETE: gone.txt\n")
         self.assertEqual(session.apply(answer),
-                         ({"old.txt": "applied", "new.txt": "applied", "gone.txt": "deleted"}, [], []))
+                         ({"old.txt": "applied", "new.txt": "applied", "gone.txt": "deleted"}, [], [], None))
         ui.confirm.assert_not_called()
         self.assertEqual([call.args for call in ui.show.call_args_list],
                          [("old.txt", "a\n", "A\n"), ("new.txt", "", "fresh\n"), ("gone.txt", "b\n", None)])
@@ -400,12 +400,12 @@ class Edits(InTempDir):
         empty = "FILE: tests/a.cpp\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n"
         told = ("could not apply an edit to tests/a.cpp: an empty block changes nothing; "
                 "to delete the file, write DELETE: tests/a.cpp")
-        self.assertEqual(tolken.Session(ui).apply(empty), ({}, [told], []))
+        self.assertEqual(tolken.Session(ui).apply(empty), ({}, [told], [], None))
         ui.confirm.assert_not_called()
         self.assertTrue(os.path.exists("tests/a.cpp"))
         # Beside a DELETE: line for the same file, only the DELETE: line deletes it.
         self.assertEqual(tolken.Session(ui).apply(empty + "DELETE: tests/a.cpp\n"),
-                         ({"tests/a.cpp": "deleted"}, [told], []))
+                         ({"tests/a.cpp": "deleted"}, [told], [], None))
         ui.confirm.assert_called_once_with("tests/a.cpp", "int main() {}\n", None)
 
 
@@ -660,6 +660,13 @@ class Commands(InTempDir):
         self.assertEqual(len(prompts), 1)
         ui.ran.assert_not_called()
 
+    def test_refusing_a_command_with_what_to_do_instead_goes_on(self):
+        prompts, ui = self.send(['RUN: python -c "print(1)"\n', "ok"], "ask", allowed="run the tests instead")
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(prompts[1].startswith('the user did not let python -c "print(1)" run. '
+                                              "Instead, the user said: run the tests instead\n"))
+        ui.ran.assert_not_called()
+
     def test_a_command_not_allowed_waits_even_in_auto(self):
         prompts, ui = self.send(["RUN: pip list\n", "never"], "auto", allowed=False)
         ui.allow.assert_called_once_with("pip list")
@@ -895,6 +902,33 @@ class Rounds(InTempDir):
         calls = self.run_main([self.EDIT.format("a.py", "old a", "new a") + "CONTINUE", "never"], replies=["n"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(read_bytes("a.py"), b"old a\n")
+
+    def test_after_a_no_the_rest_of_the_answer_is_not_asked_about(self):
+        for name in ("a.py", "b.py", "c.py", "d.py"):
+            write(name, f"old {name}\n")
+        three = "".join(self.EDIT.format(name, f"old {name}", f"new {name}") for name in ("a.py", "b.py", "c.py"))
+        calls = self.run_main([three + "DELETE: d.py\nCONTINUE", "ok"], inputs=["zzz one", "y", "n", "zzz two"])
+        self.assertEqual(len(calls), 2)  # the message ended at the no; the second call is the next message
+        self.assertEqual([read_bytes(name) for name in ("a.py", "b.py", "c.py", "d.py")],
+                         [b"new a.py\n", b"old b.py\n", b"old c.py\n", b"old d.py\n"])
+        self.assertEqual(self.sent[1], "What happened after your last answer:\napplied a.py\n"
+                                       "the user declined the edit to b.py; it was not applied\n"
+                                       "your later changes were not made either: c.py, deleting d.py\n\nzzz two")
+
+    def test_what_to_do_instead_goes_to_the_model_at_once(self):
+        for name in ("a.py", "b.py", "c.py"):
+            write(name, f"old {name}\n")
+        three = "".join(self.EDIT.format(name, f"old {name}", f"new {name}") for name in ("a.py", "b.py", "c.py"))
+        calls = self.run_main([three, "DONE", "never"], inputs=["zzz one", "y", "use a dict", "zzz two"])
+        self.assertEqual(len(calls), 3)  # the answer to the comment, then the next message
+        self.assertEqual(read_bytes("b.py"), b"old b.py\n")
+        self.assertTrue(self.sent[1].endswith(
+            "\n\napplied a.py\nthe user declined the edit to b.py; it was not applied. Instead, the user said: "
+            "use a dict\nyour later changes were not made either: c.py\n" + tolken.GO_ON))
+        self.assertIn("--- b.py (lines 1-1 of 1) ---\nold b.py", self.sent[1])  # the files it named, as they are now
+        self.assertIn("--- c.py (lines 1-1 of 1) ---\nold c.py", self.sent[1])
+        self.assertTrue(self.continues(2))
+        self.assertEqual(self.sent[2], "zzz two")  # told once
 
     def test_the_next_message_tells_the_model_what_it_was_not_told(self):
         write("a.py", "old a\n")

@@ -226,9 +226,13 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompt.placeholder, tui.EDIT_KEYS)
             self.assertEqual(self.items()[2:], ["Change it:", "1   one\n2 - two\n2 + 2"])  # no raw block; the card
             self.assertEqual(str(self.app.query(".card").first().border_title), "edit a.txt · +1 −1")
-            await pilot.press("y", "x")  # other keys do not answer the question
+            await pilot.press("y", "x")  # other keys do not answer the question: they type what to do instead
             await pilot.pause(0.2)
             self.assertTrue(self.app.asking)
+            self.assertTrue(self.status().endswith("│ " + tui.COMMENT_KEYS))
+            await pilot.press("backspace", "backspace")
+            await pilot.pause(0.2)
+            self.assertTrue(self.status().endswith("│ " + tui.EDIT_KEYS))
             await pilot.press(key)
             await self.until(pilot, lambda: not self.app.busy)
             self.assertEqual((prompt.placeholder, prompt.value, prompt.disabled), (tui.PLACEHOLDER, "", False))
@@ -261,6 +265,60 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             with open("a.txt", encoding="utf-8") as f, open("b.txt", encoding="utf-8") as g:
                 self.assertEqual((f.read(), g.read()), ("1\n", "two\n"))
             self.assertEqual(self.prompts, ["(No file contents have been shown yet.)\n\nzzz change both"])
+
+    async def test_text_typed_at_a_change_says_no_and_goes_to_the_model(self):
+        write("a.txt", "one\n")
+        write("b.txt", "two\n")
+        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "\n" + self.BLOCK.format("b.txt", "two", "2"), "DONE"]
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "zzz change both")
+            await self.until(pilot, lambda: self.app.asking)
+            await pilot.press("enter")
+            await self.until(pilot, lambda: self.app.asking and "b.txt" in str(self.app.prompt.border_title))
+            await pilot.press("u", "s", "e", "space", "3")
+            await pilot.press("enter")
+            await self.until(pilot, lambda: not self.app.busy)
+            items = self.items()
+            self.assertLess(items.index("> use 3"), items.index("skipped b.txt"))
+            self.assertEqual(len(self.prompts), 2)
+            self.assertIn("the user declined the edit to b.txt; it was not applied. Instead, the user said: use 3",
+                          self.prompts[1])
+            with open("a.txt", encoding="utf-8") as f, open("b.txt", encoding="utf-8") as g:
+                self.assertEqual((f.read(), g.read()), ("1\n", "two\n"))
+            self.assertEqual(self.app.prompt.value, "")
+
+    async def test_escape_stops_and_the_rest_is_not_asked_about(self):
+        write("a.txt", "one\n")
+        write("b.txt", "two\n")
+        self.answers = [self.BLOCK.format("a.txt", "one", "1") + "\n" + self.BLOCK.format("b.txt", "two", "2")]
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "zzz change both")
+            await self.until(pilot, lambda: self.app.asking)
+            await pilot.press("escape")
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertIn("skipped a.txt", self.items())
+            self.assertEqual(len(self.app.query(".card")), 1)  # b.txt's change was never shown
+            self.assertEqual(len(self.prompts), 1)
+            with open("a.txt", encoding="utf-8") as f, open("b.txt", encoding="utf-8") as g:
+                self.assertEqual((f.read(), g.read()), ("one\n", "two\n"))
+
+    async def test_a_message_typed_while_working_is_set_aside_during_a_question(self):
+        write("a.txt", "one\n")
+        self.hold = threading.Event()
+        self.answers = [self.BLOCK.format("a.txt", "one", "1"), "DONE"]
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "zzz change it")
+            await self.until(pilot, lambda: self.prompts)
+            await pilot.press("n", "e", "x", "t")
+            self.hold.set()
+            await self.until(pilot, lambda: self.app.asking)
+            self.assertEqual(self.app.prompt.value, "")
+            self.assertTrue(self.status().endswith("│ " + tui.EDIT_KEYS))
+            await pilot.press("enter")  # nothing typed since: yes
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertEqual(self.app.prompt.value, "next")
+            with open("a.txt", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "1\n")
 
     async def test_shift_tab_switches_between_asking_and_making_changes_at_once(self):
         async with self.app.run_test() as pilot:

@@ -15,10 +15,12 @@ first listed (Ollama's come before llama-server's).
 Thinking, when it is on, is shown dim above the answer. The answer is shown as
 markdown (headings, lists, tables, highlighted code), each line break kept.
 /undo puts back the files that the last message to change files changed.
-An edit is shown as a card; Enter applies it, Esc skips it. A file the model
-wants to delete is shown the same way; Enter deletes it, Esc keeps it. So is a
-command it wants to run: Enter runs it, Esc refuses; its output then follows as
-a card, and Esc stops a command that is running.
+An edit is shown as a card; Enter applies it. A file the model wants to delete
+is shown the same way; Enter deletes it. So is a command it wants to run: Enter
+runs it; its output then follows as a card, and Esc stops a command that is
+running. Text typed while one of them waits says no to it, and goes to the
+model as what to do instead, which it is asked to do at once; Esc says no and
+stops. After a no, the rest of that answer is not asked about or made.
 Shift+Tab switches between asking before every change ("ask") and making the
 changes at once, still showing each card ("auto"); a card waiting for Enter is
 then applied. The input box's lower border shows the mode; settings.json's
@@ -63,9 +65,10 @@ COMMANDS = {  # what typing / offers, in this order
     "/clear": "forget the loaded code and the conversation",
     "/exit": "quit",
 }
-EDIT_KEYS = "enter apply · esc skip"
-DELETE_KEYS = "enter delete · esc keep"
-RUN_KEYS = "enter run · esc refuse"
+EDIT_KEYS = "enter apply · or type what to do instead · esc stop"
+DELETE_KEYS = "enter delete · or type what to do instead · esc stop"
+RUN_KEYS = "enter run · or type what to do instead · esc stop"
+COMMENT_KEYS = "enter send instead · esc stop"  # shown once text is typed while a change waits
 OUTPUT_LINES = 12  # lines of a command's output shown in its card (the model gets more)
 NEWLINE_KEYS = ("shift+enter", "ctrl+j")  # Shift+Enter only where the terminal reports it; Ctrl+J everywhere
 PHRASES = (  # shown above the input while the model works, in shuffled order, a new one every 10 seconds
@@ -527,7 +530,7 @@ class TolkenApp(App):
         height: auto; max-height: 10;
         border: round #555555; background: $background; background-tint: $foreground 0%;
     }
-    Prompt:disabled { opacity: 1; border: round #aaaaaa; }
+    Prompt.asking { border: round #aaaaaa; }
     Prompt { border-subtitle-color: $text-muted; }
     Prompt.auto { border-subtitle-color: #e5c07b; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
@@ -562,7 +565,9 @@ class TolkenApp(App):
         self.thought, self.thought_text = None, ""  # the same for the thinking before it
         self.shown, self.shown_text = None, ""  # the same for the last answer that finished
         self.busy = False  # a message is being answered
-        self.asking, self.reply = None, False  # the Event of an edit waiting for Enter / Esc, and the answer given
+        # The Event of a change waiting for Enter / Esc, and the answer given: True, False or what to do instead.
+        self.asking, self.reply = None, False
+        self.set_aside = ("", {})  # what was in the input when a change began to wait, put back after the answer
         self.activity, self.call, self.used = "ready", None, None
         self.started = self.call_started = 0.0
         self.calls, self.call_timings = 0, []
@@ -722,7 +727,8 @@ class TolkenApp(App):
                 parts.append(f"call {self.call}")
             parts.append(f"{time.monotonic() - self.call_started:.1f}s")
         context = f"{self.used or 0:,}/{size:,} ({(self.used or 0) * 100 // size}%)"
-        keys = self.prompt.placeholder if self.asking else "please wait" if self.loading else "esc cancel" if self.busy \
+        asked = COMMENT_KEYS if self.prompt.value.strip() else self.prompt.placeholder
+        keys = asked if self.asking else "please wait" if self.loading else "esc cancel" if self.busy \
             else "↑↓ choose · enter select · esc close" if self.models is not None \
             else "↑↓ choose · enter run · tab complete · esc close" if self.commands is not None \
             else "enter send · shift+enter new line · ctrl+c twice to exit"
@@ -961,11 +967,17 @@ class TolkenApp(App):
         self.question(asked, "run command?", "Run this command?", RUN_KEYS)
 
     def question(self, asked, activity, title, keys):
-        """Make the input box the question until Enter or Esc answers it (see answer_diff)."""
+        """Make the input box the question until Enter or Esc answers it (see answer_diff).
+
+        What it holds is set aside, so that a message typed while the model worked is not taken for an answer.
+        """
         self.asking, self.activity = asked, activity
+        self.set_aside = (self.prompt.value, dict(self.prompt.pastes))
+        self.prompt.value, self.prompt.pastes = "", {}
         self.prompt.border_title = escape(title)
         self.prompt.placeholder = keys
-        self.prompt.disabled = True
+        self.prompt.add_class("asking")
+        self.prompt.focus()
         self.tick()
 
     def show_run(self, command, code, seconds, output):
@@ -980,21 +992,39 @@ class TolkenApp(App):
         if card:
             card.border_title = escape(f"{command} · {ended}")
 
-    def answer_diff(self, yes):
+    def answer_diff(self, reply):
+        """Answer the waiting question: True (yes), False (no) or what to do instead.
+
+        The input's text from before the question comes back, unless text typed since is still there
+        (Esc after typing): that stays for the next message, and the older text goes to the Up history.
+        """
         asked, self.asking = self.asking, None
-        self.reply, self.activity = yes, "working"
+        self.reply, self.activity = reply, "working"
         self.prompt.border_title = ""
         self.prompt.placeholder = PLACEHOLDER
-        self.prompt.disabled = False
+        self.prompt.remove_class("asking")
+        text, pastes = self.set_aside
+        self.set_aside = ("", {})
+        if not self.prompt.value.strip():
+            self.prompt.value, self.prompt.pastes = text, pastes
+        elif text.strip():
+            self.history.append((text, pastes))
         self.prompt.focus()
         asked.set()
 
     def check_action(self, action, parameters):
-        """Enter applies a waiting edit; at any other time it sends the message as usual."""
+        """Enter answers a waiting change; at any other time it sends the message as usual."""
         return bool(self.asking) if action == "accept" else True
 
     def action_accept(self):
-        self.answer_diff(True)
+        """Enter: yes to the waiting change, or no, with the text typed as what to do instead."""
+        if shift_held():
+            self.prompt.insert("\n")
+            return
+        typed, message = self.prompt.take()
+        if message:
+            self.add("> " + typed, "user")
+        self.answer_diff(message or True)
 
     def show_approval(self):
         """Show on the input box's lower border whether changes wait for the user ("ask") or not ("auto")."""
