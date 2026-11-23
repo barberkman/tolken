@@ -85,6 +85,21 @@ class Search(InTempDir):
         self.assertEqual(tolken.search("widget", 10_000), [])
         self.assertEqual(tolken.search("widget render_widget_tree", 10_000), [["tree.py", 1, 2]])
 
+    def test_the_search_ends_once_every_word_is_known_to_be_too_common(self):
+        paths = [f"f{number:03}.py" for number in range(300)]
+        for path in paths:
+            write(path, "widget = 1\n")
+        read, real = [], tolken.read_text
+
+        def reading(path, errors="strict"):
+            read.append(path)
+            time.sleep(0.001)  # so that the files are not all read before the first of them are looked at
+            return real(path, errors)
+
+        with mock.patch.object(tolken, "THREADS", 1), mock.patch.object(tolken, "read_text", reading):
+            self.assertEqual(tolken.search("widget", 10_000, paths), [])
+        self.assertLess(len(read), 250)  # widget was on over COMMON lines after 201 files
+
     def test_nearby_hits_merge_and_budget_limits(self):
         write("a.py", "\n".join(f"line{i}" for i in range(1, 201)) + "\n")
         self.assertEqual(tolken.search("line50 line60 line150", 100_000),
@@ -145,6 +160,44 @@ class Project(InTempDir):
         self.assertEqual(list(tolken.project_files()), [".gitignore", "kept.txt", "sub/a.py", "sub/b.py"])
         with mock.patch.object(tolken, "git_files", lambda: None):  # outside git: every file, as before
             self.assertIn("secret.txt", list(tolken.project_files()))
+
+    def test_when_git_takes_too_long_over_untracked_files_only_tracked_ones_are_listed(self):
+        ran = []
+
+        def run(command, **options):
+            ran.append(command)
+            if "--others" in command:
+                raise subprocess.TimeoutExpired(command, options["timeout"])
+            return subprocess.CompletedProcess(command, 0, b"a.py\0src/b.py\0")
+
+        with mock.patch.object(tolken, "UNTRACKED", True), mock.patch.object(tolken.subprocess, "run", run):
+            self.assertEqual(tolken.git_files(), ["a.py", "src/b.py"])  # not every file there is, ignored ones too
+            self.assertEqual(tolken.git_files(), ["a.py", "src/b.py"])
+        self.assertEqual(["--others" in command for command in ran], [True, False, False])  # not waited for again
+
+    def test_a_large_project_is_listed_showing_how_far_it_is_and_esc_ends_it(self):
+        for number in range(40):
+            write(f"f{number:02}.py", "x\n")
+        write("logo.bin", "a\0b")
+        session, real = tolken.Session(mock.Mock()), tolken.is_text
+
+        def slowly(path):
+            time.sleep(0.03)
+            return real(path)
+
+        with mock.patch.object(tolken, "THREADS", 4), mock.patch.object(tolken, "is_text", slowly):
+            self.assertEqual(tolken.readable_files(session), [f"f{number:02}.py" for number in range(40)])
+        shown = [call.args[0] for call in session.ui.activity.call_args_list]
+        self.assertTrue(shown)
+        for text in shown:
+            self.assertRegex(text, r"^listing project · \d+ of 41 files$")
+
+        def cancelling(path):
+            session.stopped = True
+            return True
+
+        with mock.patch.object(tolken, "is_text", cancelling):
+            self.assertLess(len(tolken.readable_files(session)), 40)  # cut short
 
     def test_heads_share_the_budget(self):
         for name in ("a.py", "b.py"):
@@ -407,6 +460,45 @@ class Edits(InTempDir):
         self.assertEqual((read_bytes("old.txt"), read_bytes("new.txt"), os.path.exists("gone.txt")),
                          (b"A\n", b"fresh\n", False))
 
+    def test_a_file_that_cannot_be_written_or_deleted_is_a_problem_and_the_rest_goes_on(self):
+        os.mkdir("pkg")
+        write("locked.txt", "x\n")
+        write("a.txt", "one\n")
+        session = tolken.Session(mock.Mock())
+        session.approve = "auto"
+        answer = ("FILE: pkg\n<<<<<<< SEARCH\n=======\nhello\n>>>>>>> REPLACE\n"
+                  "FILE: a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n"
+                  "DELETE: locked.txt\n")
+        with mock.patch.object(tolken.os, "remove", side_effect=PermissionError(13, "Permission denied")):
+            changed, problems, declined, comment = session.apply(answer)
+        self.assertEqual((changed, declined, comment), ({"a.txt": "applied"}, [], None))
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(problems[0].startswith("could not edit pkg: "), problems[0])  # a folder, not a file
+        self.assertEqual(problems[1], "could not delete locked.txt: Permission denied")
+        self.assertEqual(read_bytes("a.txt"), b"1\n")
+
+    def test_tolkens_own_lines_inside_an_edit_block_are_the_files_text(self):
+        write("keep.py", "x\n")
+        write("other.py", "y\n")
+        ui, seen = mock.Mock(), []
+        text = "DELETE: keep.py\nRUN: python -m pytest\nNEED: other.py\n"
+        answer = f"FILE: NOTES.md\n<<<<<<< SEARCH\n=======\n{text}>>>>>>> REPLACE\nDONE\n"
+
+        def chat(messages, *_):
+            seen.append(messages)
+            return answer
+
+        with mock.patch.object(tolken, "chat", chat), mock.patch.object(tolken, "count", lambda *_: 10), \
+                mock.patch.object(tolken, "run_command") as ran:
+            session = tolken.Session(ui, 8192)
+            session.approve = "auto"
+            session.send("zzz write the notes")
+        self.assertEqual(len(seen), 1)  # no second call to show other.py
+        self.assertTrue(os.path.exists("keep.py"))
+        ran.assert_not_called()
+        ui.allow.assert_not_called()
+        self.assertEqual(read_bytes("NOTES.md"), text.encode())
+
     def test_the_plain_prompt_shows_a_change_it_makes_at_once(self):
         write("a.txt", "one\n")
         out = io.StringIO()
@@ -508,6 +600,66 @@ def write_bytes(path, data):
         f.write(data)
 
 
+def docx_xml(body):
+    """A .docx whose document body is this XML."""
+    import zipfile
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as archive:
+        archive.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                                              f'wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>')
+    return data.getvalue()
+
+
+class ReadPdf(unittest.TestCase):
+    def test_text_pages_give_text_and_pages_without_text_give_images(self):
+        import base64
+        import documents
+        import fitz
+        result = documents.read_pdf(pdf_bytes("hello pdf", ""))
+        self.assertEqual(result["text"], "[page 1]\nhello pdf")
+        self.assertEqual([image["page"] for image in result["images"]], [2])
+        png = base64.b64decode(result["images"][0]["data"])
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        image = fitz.Pixmap(png)
+        self.assertEqual(max(image.width, image.height), documents.MAX_SIDE)
+        self.assertEqual(result["note"], "")
+
+    def test_scanned_pages_beyond_the_limit_are_left_out_with_a_note(self):
+        import documents
+        with mock.patch.object(documents, "PDF_PAGE_IMAGES", 2):
+            result = documents.read_pdf(pdf_bytes("", "", "", "text"))
+        self.assertEqual([image["page"] for image in result["images"]], [1, 2])
+        self.assertEqual(result["text"], "[page 4]\ntext")
+        self.assertIn("1 more", result["note"])
+
+
+class ReadDocx(unittest.TestCase):
+    def test_paragraphs_give_lines_with_tabs_breaks_and_links(self):
+        import documents
+        result = documents.read_docx(docx_xml(
+            "<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:tab/><w:t>world</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>one</w:t><w:br/><w:t>two</w:t></w:r>"
+            "<w:hyperlink><w:r><w:t> link</w:t></w:r></w:hyperlink></w:p>"))
+        self.assertEqual(result["text"], "Hello\tworld\none\ntwo link")
+
+    def test_tables_give_a_line_per_row_in_document_order(self):
+        import documents
+        cell = "<w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc>"
+        row = "<w:tr>" + cell + cell + "</w:tr>"
+        result = documents.read_docx(docx_xml(
+            "<w:p><w:r><w:t>before</w:t></w:r></w:p>"
+            "<w:tbl>" + row.format("a", "b") + row.format("c", "d") + "</w:tbl>"
+            "<w:p><w:r><w:t>after</w:t></w:r></w:p>"))
+        self.assertEqual(result["text"], "before\na | b\nc | d\nafter")
+
+    def test_broken_files_refused(self):
+        import documents
+        empty_zip = b"PK\x05\x06" + b"\0" * 18  # a zip without word/document.xml
+        for data in (b"not a docx", empty_zip, docx_xml("<w:p>")):  # the last has broken XML
+            with self.assertRaises(ValueError):
+                documents.read_docx(data)
+
+
 class Documents(InTempDir):
     def test_pdf_and_word_files_are_listed_and_shown_as_their_text(self):
         write_bytes("spec.pdf", pdf_bytes("first page", "second page"))
@@ -529,6 +681,13 @@ class Documents(InTempDir):
         self.assertEqual(len(images), 1)
         self.assertIn("[1 page(s) without text, such as scans, are sent as images]", text)
         self.assertEqual(tolken.images_of(["scan.pdf", 1, None]), images)
+
+    def test_without_pymupdf_a_document_says_so(self):
+        write_bytes("spec.pdf", pdf_bytes("page"))
+        with mock.patch.dict("sys.modules", {"documents": None}):  # importing it fails
+            self.assertEqual(tolken.contents("spec.pdf"),
+                             ("[this file cannot be read: PyMuPDF is not installed (pip install pymupdf)]", []))
+        self.assertIn("page", tolken.contents("spec.pdf")[0])  # not remembered: read once it is installed
 
     def test_a_file_that_cannot_be_read_says_so(self):
         write_bytes("broken.pdf", b"not a pdf")
@@ -625,6 +784,23 @@ class Commands(InTempDir):
             code, seconds, _ = tolken.run_command('python -c "import time; time.sleep(30)"')
         self.assertIsNone(code)
         self.assertLess(seconds, 10)
+
+    def test_a_command_is_stopped_with_the_processes_it_started(self):
+        # The child holds the output open: with only the command killed, run_command would wait for the child.
+        child = "import subprocess, sys; subprocess.run([sys.executable, '-c', 'import time; time.sleep(30)'])"
+        with mock.patch.object(tolken, "RUN_TIMEOUT", 0.5):
+            code, seconds, _ = tolken.run_command(f'python -c "{child}"')
+        self.assertIsNone(code)
+        self.assertLess(seconds, 10)
+
+    def test_ctrl_c_ends_a_running_command(self):
+        process = mock.Mock()
+        process.communicate.side_effect = KeyboardInterrupt
+        with mock.patch.object(tolken.subprocess, "Popen", return_value=process), \
+                mock.patch.object(tolken, "kill_tree") as killed:
+            with self.assertRaises(KeyboardInterrupt):
+                tolken.run_command("python x.py")
+        killed.assert_called_once_with(process)
 
     def test_cancel_stops_a_running_command(self):
         session, result = tolken.Session(mock.Mock()), []
@@ -888,6 +1064,20 @@ class Rounds(InTempDir):
         for line in ("**CONTINUE**", "Continue.", "`CONTINUE`"):
             self.assertEqual(len(self.run_main(["Plan first.\n" + line, "Planned.", "never"])), 2, line)
 
+    def test_a_sentence_that_starts_with_continue_is_not_the_marker(self):
+        self.assertEqual(len(self.run_main(["Continue using the old API until v2 ships.", "never"])), 1)
+
+    def test_ctrl_c_before_an_answer_arrives_goes_back_to_the_prompt(self):
+        def interrupt(number):
+            if number == 1:
+                raise KeyboardInterrupt
+
+        try:
+            calls = self.run_main(["never", "ok"], inputs=["zzz one", "zzz two"], during=interrupt)
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C ended tolken")
+        self.assertEqual(len(calls), 2)
+
     def test_the_model_is_told_what_it_changed_earlier_in_the_task(self):
         for name in ("a.py", "b.py", "c.py"):
             write(name, f"old {name}\n")
@@ -1058,11 +1248,90 @@ class FakeModel:
         return self.answer
 
 
+class Interrupted:
+    """A streamed answer that Ctrl+C ends after its first piece."""
+
+    fp = None
+
+    def __init__(self, text):
+        self.line = b"data: " + json.dumps({"choices": [{"delta": {"content": text}}]}).encode()
+
+    def __iter__(self):
+        yield self.line
+        raise KeyboardInterrupt
+
+    def close(self):
+        pass
+
+
 class Models(InTempDir):
     def setUp(self):
         super().setUp()
         self.notes, self.ui = [], mock.Mock()
         self.ui.note = lambda text, kind="info": self.notes.append((kind, text))
+
+    def test_ctrl_c_during_an_answer_ends_the_message_before_its_edits_and_commands(self):
+        model = FakeModel("fake")
+        answer = "FILE: made.txt\n<<<<<<< SEARCH\n=======\nhello\n>>>>>>> REPLACE\nRUN: python -m pytest --version\n"
+
+        def chat(messages, ui=None, session=None):
+            model.events.append("chat")
+            return tolken.stream(Interrupted(answer), tolken.llama_line, ui, session)
+
+        model.chat = chat
+        session = tolken.Session(self.ui)
+        session.model, session.approve = model, "auto"
+        with mock.patch.object(tolken, "run_command") as ran:
+            session.send("zzz make a file")
+        self.assertEqual(model.events, ["chat"])
+        self.assertFalse(os.path.exists("made.txt"))
+        ran.assert_not_called()
+        self.assertIn(("info", "cancelled"), self.notes)
+
+    def test_esc_while_the_project_is_listed_or_searched_ends_the_message(self):
+        write("a.py", "needle here\n")
+        for stage in ("is_text", "read_text"):  # what listing and searching read a file with
+            model, session = FakeModel("fake"), tolken.Session(self.ui)
+            session.model = model
+
+            def cancelling(*arguments, real=getattr(tolken, stage), session=session):
+                session.cancel()
+                return real(*arguments)
+
+            with mock.patch.object(tolken, stage, cancelling):
+                session.send("zzz where is the needle")
+            self.assertEqual((model.events, session.ctx, session.listed), ([], [], set()), stage)
+        self.assertEqual([text for _, text in self.notes], ["cancelled", "cancelled"])
+
+    def test_the_user_is_told_once_that_untracked_files_are_no_longer_listed(self):
+        session = tolken.Session(self.ui)
+        session.model = FakeModel("fake")
+        with mock.patch.object(tolken, "UNTRACKED", False):
+            session.send("zzz one")
+            session.send("zzz two")
+        self.assertEqual(len([text for kind, text in self.notes if kind == "warn" and "only the files" in text]), 1)
+
+    def test_a_call_cancelled_before_its_answer_is_not_reported_as_a_server_error(self):
+        model, session = FakeModel("fake"), tolken.Session(self.ui)
+
+        def chat(messages, ui=None, called=None):
+            session.cancel()
+            raise OSError("the connection was closed")
+
+        model.chat = chat
+        session.model = model
+        session.send("zzz hello")
+        self.assertEqual([text for _, text in self.notes if "cannot reach" in text or text == "cancelled"],
+                         ["cancelled"])
+
+    def test_a_loaded_file_that_cannot_be_read_is_not_reported_as_a_server_error(self):
+        write("a.py", "x\n")
+        session = tolken.Session(self.ui)
+        session.model = FakeModel("fake")
+        with mock.patch.object(tolken, "read_text", side_effect=PermissionError(13, "Permission denied", "a.py")):
+            session.send("zzz look at @a.py")
+        self.assertIn(("bad", "could not read a.py: Permission denied"), self.notes)
+        self.assertEqual([text for _, text in self.notes if "cannot reach" in text], [])
 
     def test_use_switches_the_model_and_keeps_the_conversation(self):
         session = tolken.Session(self.ui, 8192, "demo.gguf")
@@ -1236,7 +1505,7 @@ class Models(InTempDir):
 
     def test_found_code_is_capped_whatever_the_window(self):
         budgets = []
-        with mock.patch.object(tolken, "search", lambda question, budget, files: budgets.append(budget) or []), \
+        with mock.patch.object(tolken, "search", lambda question, budget, *_: budgets.append(budget) or []), \
                 mock.patch.object(tolken, "count", lambda *_: 10), \
                 mock.patch.object(tolken, "chat", lambda *_: "ok"):
             for size in (4000, 8192, 32768):
@@ -1329,6 +1598,52 @@ class Settings(InTempDir):
         self.assertTrue(tolken.RULES.endswith("redirection.\n\nRun RUN: build.cmd before DONE."))
         self.assertIn("unknown settings ignored: tempreature", self.printed.getvalue())
 
+    def test_a_setting_of_the_wrong_kind_exits_naming_it(self):
+        for settings, name in (({"run": "python -m pytest"}, "run"), ({"max_out": "2000"}, "max_out"),
+                               ({"servers": [8080]}, "servers"), ({"think": 1}, "think"), ({"context": "8k"}, "context")):
+            write("settings.json", json.dumps(settings))
+            with self.assertRaises(SystemExit) as caught:
+                tolken.load_settings("settings.json")
+            self.assertTrue(caught.exception.code.startswith(f'settings.json: "{name}" must be '), name)
+
+    def test_one_setting_is_saved_into_the_file_and_applied(self):
+        write("settings.json", json.dumps({"think": "high", "tempreature": 1}))
+        with mock.patch.object(tolken, "SETTINGS", "settings.json"):
+            tolken.save_setting("max_out", 8000)
+            tolken.save_setting("run", ["build.cmd"])
+        with open("settings.json", encoding="utf-8") as f:  # what else the file holds is kept
+            self.assertEqual(json.load(f), {"think": "high", "tempreature": 1, "max_out": 8000, "run": ["build.cmd"]})
+        self.assertEqual((tolken.MAX_OUT, tolken.RUN), (8000, ["build.cmd"]))
+        self.assertEqual(tolken.current_settings()["max_out"], 8000)
+        self.assertIn("These commands are allowed (arguments may follow them): build.cmd.", tolken.RULES)
+
+    def test_a_value_of_the_wrong_kind_or_a_broken_file_is_not_saved(self):
+        write("settings.json", '{"max_out": 4000}')
+        with mock.patch.object(tolken, "SETTINGS", "settings.json"):
+            with self.assertRaises(ValueError) as caught:
+                tolken.save_setting("max_out", "lots")
+            self.assertEqual(str(caught.exception), '"max_out" must be a whole number')
+            self.assertEqual((read_bytes("settings.json"), tolken.MAX_OUT), (b'{"max_out": 4000}', 2000))
+            write("settings.json", '{"max_out": 4000,}')
+            with self.assertRaises(ValueError):
+                tolken.save_setting("max_out", 8000)
+            self.assertEqual((read_bytes("settings.json"), tolken.MAX_OUT), (b'{"max_out": 4000,}', 2000))
+            os.remove("settings.json")
+            tolken.save_setting("max_out", 8000)  # a file that is gone is written anew
+            self.assertEqual(json.loads(read_bytes("settings.json")), {"max_out": 8000})
+
+    def test_a_session_takes_up_a_changed_setting(self):
+        with mock.patch.object(tolken, "SETTINGS", "settings.json"):
+            session = tolken.Session(mock.Mock())
+            session.log = [{"role": "system", "content": "the rules as they were"}]
+            session.configure("think", "low")
+            self.assertEqual((tolken.THINK, len(session.log)), ("low", 1))  # the conversation goes on as it was
+            session.configure("approve", "auto")
+            self.assertEqual(session.approve, "auto")
+            session.configure("instructions", "Answer in Turkish.")
+            self.assertEqual(session.log, [])  # the system prompt changed: the next prompt is built afresh
+            self.assertTrue(tolken.RULES.endswith("Answer in Turkish."))
+
     def test_a_broken_file_exits_with_the_error(self):
         write("settings.json", '{"think": true,}')
         with self.assertRaises(SystemExit) as caught:
@@ -1340,6 +1655,12 @@ class Settings(InTempDir):
 
 
 class Terminal(InTempDir):
+    def test_y_or_yes_says_yes_and_any_other_text_is_what_to_do_instead(self):
+        for typed, answer in (("y", True), ("Y", True), ("yes", True), (" YES ", True), ("n", False), ("no", False),
+                              ("", False), ("use a dict", "use a dict")):
+            with mock.patch("builtins.input", return_value=typed):
+                self.assertEqual(tolken.Plain().answer("? "), answer, typed)
+
     def test_single_and_multi_line_message(self):
         with mock.patch("builtins.input", return_value="  hi  "):
             self.assertEqual(tolken.read_message(), "hi")
@@ -1415,6 +1736,9 @@ class FakeServer(http.server.BaseHTTPRequestHandler):
             return
         if body["messages"][-1]["content"] == "stall":
             self.stall(b'data: {"choices": [{"delta": {"content": "Hel"}}]}\n\n')
+            return
+        if body["messages"][-1]["content"] == "slow":  # still reading the prompt: no answer, not even its headers
+            FakeServer.release.wait(10)
             return
         if body["messages"][-1]["content"] == "long":  # thinking that runs into the length limit
             FakeServer.chat_request = body
@@ -1551,7 +1875,7 @@ class Server(InTempDir):
 
     def test_a_learned_ratio_lets_more_code_in(self):
         budgets = []
-        with mock.patch.object(tolken, "search", lambda question, budget, files: budgets.append(budget) or []):
+        with mock.patch.object(tolken, "search", lambda question, budget, *_: budgets.append(budget) or []):
             for ratio in (3, 4):
                 model = FakeModel("m", 4000)
                 model.chars_per_token = ratio
@@ -1624,6 +1948,30 @@ class Server(InTempDir):
         self.assertFalse(call.is_alive())
         self.assertEqual(result, ["Hel"])
         self.assertLess(time.time() - started, 1)
+
+    def test_cancel_ends_a_call_the_server_has_not_begun_to_answer(self):
+        FakeServer.release = threading.Event()
+        self.addCleanup(FakeServer.release.set)
+        session, result = tolken.Session(), []
+
+        def call():
+            try:
+                tolken.chat([{"role": "user", "content": "slow"}], self.url, tolken.PLAIN, session)
+            except OSError as error:
+                result.append(error)
+
+        thread = threading.Thread(target=call)
+        thread.start()
+        deadline = time.time() + 5
+        while session.sock is None and time.time() < deadline:
+            time.sleep(0.01)
+        started = time.time()
+        session.cancel()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.time() - started, 1)
+        self.assertEqual(len(result), 1)  # the call ends with an error, which send() takes for the cancelling
+        self.assertIsNone(session.sock)
 
     def test_timings(self):
         seen = []

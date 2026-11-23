@@ -9,13 +9,15 @@ otherwise, or with --plain, it is a plain prompt.
   @path          pin a whole file
   @path:10-50    pin a line range
   /model         list the models (llama-server's and every Ollama server's); /model NAME switches
+  /settings      list the settings and change one (full-screen interface)
   /undo          put back the files that the last message to change files changed
   /clear         forget the pinned code and the conversation
   /exit          exit
   \"\"\"            on a line by itself starts and ends a multi-line message (plain prompt)
 
 Settings are read at startup from settings.json next to this file, which is
-written with the defaults when it is missing. Keys left out keep their defaults:
+written with the defaults when it is missing; /settings changes one, there and
+for the session that is running. Keys left out keep their defaults:
   servers         llama-server and Ollama URLs, on this computer or another one on the
                   network (there, set OLLAMA_HOST=0.0.0.0:11434 and open port 11434);
                   each server is asked which of the two it is
@@ -73,6 +75,7 @@ its edits are made. It runs without a shell (shell syntax is refused, since a
 RUN_TIMEOUT seconds, and the start and end of its output go back to the model,
 which is then called again.
 """
+import concurrent.futures
 import difflib
 import http.client
 import itertools
@@ -80,6 +83,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -109,6 +113,8 @@ DOCUMENTS = {".pdf", ".docx"}  # shown as their text
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}  # sent as pictures, to a model that can see
 BEFORE, AFTER = 10, 20  # lines kept around a search hit
 MAX_FILE = 1_000_000    # bytes; larger files are not searched
+THREADS = 32            # files read at a time: opening one takes long on Windows, and a large project has many
+GIT_SECONDS = 10        # how long git may take to list the files; after that it is asked for the tracked ones only
 COMMON = 200            # a word found on more lines than this is ignored
 MAX_ANSWER = 3000       # characters of earlier exchanges carried into a prompt built afresh, per 8,192 tokens of window
 MAP_CHARS = 1500        # characters of the file list, per 8,192 tokens of window
@@ -177,8 +183,9 @@ BLOCK = re.compile(
 LABEL = re.compile(r"^(?:file(?:[ _]?(?:path|name))?|path)\s*[:=]\s*", re.I)  # "FILE:" before a block's path
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
 # The model has more to do; markdown and case are allowed, since a missed one ends the task too early.
-# Both are looked for outside the edit blocks, and not indented, as a line of code would be.
-CONTINUE = re.compile(r"^[>*_`#-]*CONTINUE\b", re.M | re.I)
+# Both are looked for outside the edit blocks, and not indented, as a line of code would be. CONTINUE
+# stands alone on its line, so that a sentence such as "Continue using the old API" is not one.
+CONTINUE = re.compile(r"^[>*_`#-]*CONTINUE[*_`.!]*[ \t\r]*$", re.M | re.I)
 # The task is finished; in capitals only, so that "Done with a.py, now b.py" does not end it.
 DONE = re.compile(r"^[>*_`#-]*DONE\b", re.M)
 RUN_LINE = re.compile(r"^RUN:(.*)$", re.M)  # a command the model wants to run
@@ -235,7 +242,10 @@ def contents(path):
     images are PNGs in base64: the picture itself, or a PDF's pages without text (scans).
     A file that cannot be read gives a text saying so.
     """
-    import documents  # PyMuPDF is loaded only once such a file is shown
+    try:
+        import documents  # PyMuPDF is loaded only once such a file is shown
+    except ImportError:
+        return "[this file cannot be read: PyMuPDF is not installed (pip install pymupdf)]", []
     status = os.stat(path)
     key, known = (status.st_mtime_ns, status.st_size), READ.get(os.path.abspath(path))
     if known and known[0] == key:
@@ -314,14 +324,27 @@ def within(entries, budget):
     return entries[first:]
 
 
+UNTRACKED = True  # whether git is asked for the untracked files too; False once that took too long
+
+
 def git_files():
     """The files git lists under the current directory; None outside a git work tree, or without git.
 
-    They are the tracked files and the untracked ones that .gitignore does not exclude.
+    They are the tracked files and the untracked ones that .gitignore does not exclude. To find the
+    untracked ones git reads every folder; once that has taken over GIT_SECONDS, only the tracked files
+    are listed from then on, which git knows without looking (Session.send() tells the user).
     """
+    global UNTRACKED
+    command = ["git", "ls-files", "-z", "--cached"]
     try:
-        done = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                              capture_output=True, timeout=10)
+        if UNTRACKED:
+            try:
+                done = subprocess.run(command + ["--others", "--exclude-standard"], capture_output=True,
+                                      timeout=GIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                UNTRACKED = False
+        if not UNTRACKED:
+            done = subprocess.run(command, capture_output=True, timeout=GIT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode:
@@ -401,9 +424,33 @@ def is_text(path):
     return text
 
 
-def readable_files():
-    """The project's files that can be shown: text (not too large), PDF and Word documents, and images."""
-    return [path for path in project_files() if kind(path) or is_text(path)]
+def in_threads(work, paths, session=None, doing=""):
+    """work(path) for each of paths, in their order, worked out THREADS at a time.
+
+    With a session, doing and how many are done are shown as its activity, and the results end early
+    once it is cancelled.
+    """
+    pool, shown = concurrent.futures.ThreadPoolExecutor(THREADS), time.monotonic()
+    try:
+        for number, result in enumerate(pool.map(work, paths), 1):
+            if session and session.stopped:
+                return
+            if session and time.monotonic() - shown >= 0.2:
+                session.ui.activity(f"{doing} · {number:,} of {len(paths):,} files")
+                shown = time.monotonic()
+            yield result
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)  # the files not begun yet are left alone
+
+
+def readable_files(session=None):
+    """The project's files that can be shown: text (not too large), PDF and Word documents, and images.
+
+    With a session, its activity shows how far the listing is, and a cancelled one gets a list cut short.
+    """
+    paths = list(project_files())
+    shown = in_threads(lambda path: bool(kind(path)) or is_text(path), paths, session, "listing project")
+    return [path for path, show in zip(paths, shown) if show]
 
 
 def project_map(budget, files=None):
@@ -466,26 +513,50 @@ def keywords(question):
     return words
 
 
-def search(question, budget, files=None):
+def search(question, budget, files=None, session=None):
     """Pick snippets for a question by plain text search under the current directory.
 
     budget is in characters; files are the project's readable files, when they have been listed
     already (only text files are searched). Returns context entries, least relevant first.
+    With a session, its activity shows how far the search is, and cancelling it cuts the search short.
     """
     words = keywords(question)
     if not words:
         return []
-    pattern = re.compile(r"\b(?:" + "|".join(words) + r")\b", re.I)
+
+    def whole(words):
+        return re.compile(r"\b(?:" + "|".join(words) + r")\b", re.I)
+
+    pattern, sought = whole(words), set(words)  # sought: the words still looked for
+
+    def holding(path):
+        """The lines of a text file that holds one of the words somewhere, else None: most files hold none,
+        and one look at the whole text spares going through their lines."""
+        try:
+            if not kind(path) and os.path.getsize(path) <= MAX_FILE:
+                text = read_text(path)
+                if "\0" not in text and pattern.search(text):
+                    return text.splitlines()
+        except (OSError, UnicodeDecodeError):
+            pass
+        return None
+
+    paths = list(project_files()) if files is None else files
     hits, sizes, counts = {}, {}, dict.fromkeys(words, 0)  # hits: path -> {line number: words}
-    for path in project_files() if files is None else files:
-        lines = lines_of(path) or ()
-        for number, line in enumerate(lines, 1):
+    for path, lines in zip(paths, in_threads(holding, paths, session, "searching project")):
+        for number, line in enumerate(lines or (), 1):
             found = {w.lower() for w in pattern.findall(line)} & words.keys()
             if found:
                 hits.setdefault(path, {})[number] = found
                 sizes[path] = len(lines)
                 for word in found:
                     counts[word] += 1
+        if lines and any(counts[word] > COMMON for word in sought):
+            # A word found on that many lines is ignored below, so it need not be looked for any further.
+            sought = {word for word in sought if counts[word] <= COMMON}
+            if not sought:
+                break
+            pattern = whole(sought)
     words = {w: weight for w, weight in words.items() if counts[w] <= COMMON}
     windows = []  # [score, path, start, end]
     for path, lines in hits.items():
@@ -568,13 +639,13 @@ class Plain:
         print(clip(output, RUN_CHARS))
 
     def answer(self, question):
-        """y: True; n, no or nothing: False; any other text: the user's comment (a no, with what to do instead)."""
+        """y or yes: True; n, no or nothing: False; any other text: the user's comment (a no, with what to do instead)."""
         try:
             answer = input(question).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
-        return True if answer.lower() == "y" else False if answer.lower() in ("", "n", "no") else answer
+        return True if answer.lower() in ("y", "yes") else False if answer.lower() in ("", "n", "no") else answer
 
 
 PLAIN = Plain()
@@ -617,10 +688,33 @@ def changes(listed, files):
                     + [f"Files removed since the file list above: {', '.join(removed)}."] * bool(removed))
 
 
-def post(path, body, base):
+def post(path, body, base, session=None):
+    """The response to body, posted as JSON to a server.
+
+    With a session, the connection's socket is put on it as soon as the connection is made, so that
+    Session.cancel() can end a call that the server has not begun to answer: it may read the prompt for long.
+    """
     request = urllib.request.Request(base + path, json.dumps(body).encode(),
                                      {"Content-Type": "application/json"})
-    return urllib.request.urlopen(request)
+    if not session:
+        return urllib.request.urlopen(request)
+
+    class Connection(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()
+            session.sock = self.sock
+            if session.stopped:  # cancelled while it was being made
+                raise OSError("cancelled")
+
+    class Handler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(Connection, request)
+
+    try:
+        return urllib.request.build_opener(Handler).open(request)
+    except BaseException:
+        session.sock = None
+        raise
 
 
 def get(url):
@@ -677,6 +771,8 @@ def stream(response, read, ui=PLAIN, session=None):
                 break
     except KeyboardInterrupt:
         ui.text("\n[stopped]")
+        if session:
+            session.stopped = True  # send() then ends the message, without this answer's edits and commands
     except (OSError, http.client.HTTPException) as error:
         if not (session and session.stopped):  # a cancelled call ends with a read error; that is expected
             raise OSError(f"the answer was cut off ({error})") from error
@@ -739,7 +835,7 @@ def chat(messages, url, ui=PLAIN, session=None, size=None, think=None):
         thinking["reasoning_effort"] = think
     response = post("/v1/chat/completions", {"messages": messages, "stream": True,
                                              "max_tokens": answer_room(size) if size else MAX_OUT,
-                                             **OPTIONS, "chat_template_kwargs": thinking}, url)
+                                             **OPTIONS, "chat_template_kwargs": thinking}, url, session)
     return stream(response, llama_line, ui, session)
 
 
@@ -851,7 +947,7 @@ class Ollama:
                             "for it; it may have cut the start of the prompt", "warn")
             return piece, thought, timings, done, reason
 
-        return stream(post("/api/chat", body, self.url), read, ui, session)
+        return stream(post("/api/chat", body, self.url, session), read, ui, session)
 
 
 def models():
@@ -972,6 +1068,12 @@ def edit_blocks(answer):
             path = block_path(line)
         found.append((block, path))
     return found
+
+
+def prose(answer):
+    """An answer without its edit blocks. tolken's own lines (NEED:, RUN:, DELETE:, CONTINUE, DONE) are looked
+    for in it, so that a line of a file's new text, such as a continue statement, is not taken for one."""
+    return BLOCK.sub("", answer)
 
 
 def parse_edits(answer):
@@ -1176,6 +1278,19 @@ def listed(command):
     return any(entry.split() and words[:len(entry.split())] == entry.split() for entry in RUN)
 
 
+def kill_tree(process):
+    """End a command and the processes it started, which would otherwise hold its output open."""
+    try:
+        if os.name == "nt":  # while the command still runs: the processes it started are found through it
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], stdin=subprocess.DEVNULL,
+                           capture_output=True)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)  # the group run_command started it as
+    except OSError:
+        pass
+    process.kill()
+
+
 def run_command(command, session=None):
     """Run command in the project folder, without a shell; return (exit code, seconds, output).
 
@@ -1186,7 +1301,8 @@ def run_command(command, session=None):
     started = time.monotonic()
     try:  # on Windows the program itself splits its command line, as it would in a terminal
         process = subprocess.Popen(command if os.name == "nt" else shlex.split(command), stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=os.name != "nt")  # a group of its own, for kill_tree()
     except ValueError as error:
         raise OSError(error) from error
     if session:
@@ -1195,9 +1311,12 @@ def run_command(command, session=None):
         out, _ = process.communicate(timeout=RUN_TIMEOUT)
         code = process.returncode
     except subprocess.TimeoutExpired:
-        process.kill()
+        kill_tree(process)
         out, _ = process.communicate()
         code = None
+    except KeyboardInterrupt:  # Ctrl+C at the plain prompt
+        kill_tree(process)
+        raise
     finally:
         if session:
             session.process = None
@@ -1226,6 +1345,7 @@ class Session:
         self.approve = APPROVE  # "ask" or "auto"; Shift+Tab in the full-screen interface switches it
         self.cut = self.thought = False  # whether the last answer hit max_out, and whether the model thought
         self.overthought = False  # whether the last answer's thinking reached think_max
+        self.untracked = True  # whether git listed the untracked files at the last message; see git_files()
         self.clear()
 
     @property
@@ -1252,6 +1372,14 @@ class Session:
         self.model = model
         self.ui.note(f"model: {model.label} · {model.size:,} tokens")
         return True
+
+    def configure(self, name, value):
+        """Change one setting, in settings.json and for this session (see save_setting, which may raise ValueError)."""
+        save_setting(name, value)
+        if name == "approve":
+            self.approve = value
+        elif name in ("run", "instructions"):
+            self.log = []  # the system prompt has changed: the next call builds the prompt afresh
 
     def clear(self):
         """Forget the loaded code and the conversation."""
@@ -1339,7 +1467,7 @@ class Session:
         process = self.process
         if process:
             try:
-                process.kill()
+                kill_tree(process)
             except OSError:
                 pass
         sock = self.sock
@@ -1374,7 +1502,14 @@ class Session:
                 self.ctx.remove(pin)
             self.ctx.append(pin)
             self.pins.append(pin)
-        files, listing = readable_files(), MAP_CHARS * size // 8192
+        files, listing = readable_files(self), MAP_CHARS * size // 8192
+        if self.stopped:  # cancelled while the project's files were listed
+            ui.note("cancelled")
+            return
+        if self.untracked and not UNTRACKED:
+            ui.note(f"git took over {GIT_SECONDS} s to list this project's files; from now on only the files it "
+                    "tracks are listed, so a new file is seen once it is added to git", "warn")
+        self.untracked = UNTRACKED
         project = project_map(listing, files)
         news = changes(self.listed, files) if self.log else ""
         if len(news) > listing:  # so much has changed that the list is sent again, in a prompt built afresh
@@ -1405,7 +1540,11 @@ class Session:
 
         budget = room()
         if not self.ctx:
-            self.ctx = search(question, min(budget, SEARCH_TOKENS * 3), files)
+            found = search(question, min(budget, SEARCH_TOKENS * 3), files, self)
+            if self.stopped:  # cancelled while the files were searched; what was found until then is not kept
+                ui.note("cancelled")
+                return
+            self.ctx = found
         answer, full, idle = "", False, 0  # full: no room is left for more files; idle: answers in a row that did nothing
         more, progress = None, {}  # whether the model has more to do; the files this message changed so far
         for call in itertools.count(1):
@@ -1444,7 +1583,12 @@ class Session:
                 return
             except OSError as error:
                 self.log = []
-                ui.note(f"cannot reach {self.model.url} ({self.model.label}): {error}", "bad")
+                if self.stopped:  # cancelled before the server began to answer
+                    break
+                if error.filename:  # a loaded file, not the server
+                    ui.note(f"could not read {error.filename}: {error.strerror}", "bad")
+                else:
+                    ui.note(f"cannot reach {self.model.url} ({self.model.label}): {error}", "bad")
                 return
             except ValueError as error:  # a line of the stream that is not JSON
                 self.log = []
@@ -1453,12 +1597,13 @@ class Session:
             if self.stopped:
                 break
             changed, problems, declined, comment = self.apply(answer)
+            said = prose(answer)  # where its RUN:, NEED:, CONTINUE and DONE lines are looked for
             if self.cut:  # the model is called again for the rest
                 problems.append(f"your answer was cut off at the length limit ({answer_room(size):,} tokens); the "
                                 "complete edit blocks in it were handled. Give the rest in the next answer, a file "
                                 "or two at a time.")
             # After the edits, which it may test; none after a change the user said no to.
-            ran, refused, comment = ([], [], comment) if declined else self.run(answer)
+            ran, refused, comment = ([], [], comment) if declined else self.run(said)
             declined += refused
             report = [f"{done} {path}" for path, done in changed.items()] + problems + ran + declined
             # Kept for the next message unless a call of this one tells it; only what the model cannot assume.
@@ -1470,9 +1615,8 @@ class Session:
             self.widen([path for path, done in changed.items() if done == "applied"])
             if changed:
                 files = readable_files()  # with the files it created or deleted
-            wanted = self.visible([entry for entry in requested(answer, files) if entry not in self.ctx])
-            prose = BLOCK.sub("", answer)  # so that code in an edit, such as a continue statement, is no marker
-            more = CONTINUE.search(prose) or bool(changed) and not DONE.search(prose)
+            wanted = self.visible([entry for entry in requested(said, files) if entry not in self.ctx])
+            more = CONTINUE.search(said) or bool(changed) and not DONE.search(said)
             idle = 0 if changed or wanted or comment else idle + 1
             crowded = full or shown != before  # the window is full: going on is worth it only while files change
             if call == MAX_CALLS or not comment and (declined or crowded and not changed or idle == 2
@@ -1506,7 +1650,7 @@ class Session:
         if self.stopped:
             ui.note("cancelled")
             return
-        if re.search(r"^NEED:", answer, re.M):
+        if re.search(r"^NEED:", prose(answer), re.M):
             ui.note("the model still wants files; pin the part it needs with @file:START-END, "
                     "or reply to let it try again")
         elif more:
@@ -1598,7 +1742,7 @@ class Session:
         unread = len(re.findall(r"^<{5,9} SEARCH", answer, re.M)) - sum(map(len, edits.values()))
         if unread:
             problem(f"{unread} edit block(s) could not be read and were ignored; a block ends with >>>>>>> REPLACE")
-        removals = deletions(answer)
+        removals = deletions(prose(answer))
         for path, blocks in edits.items():
             if comment is not None:
                 left.append(path)
@@ -1610,8 +1754,12 @@ class Session:
                 problem(f"could not apply an edit to {path}: an empty block changes nothing; "
                         f"to delete the file, write DELETE: {path}")
             else:
-                before = raw_bytes(path), missing_folders(path)
-                done, said = edit_file(path, blocks, ui, self.approve == "auto")
+                try:
+                    before = raw_bytes(path), missing_folders(path)
+                    done, said = edit_file(path, blocks, ui, self.approve == "auto")
+                except OSError as error:  # a folder, a read-only file, one that another program holds open
+                    problem(f"could not edit {path}: {error.strerror or error}")
+                    continue
                 problems += said
                 if done is True:
                     changed[path] = "applied"
@@ -1625,8 +1773,12 @@ class Session:
             if comment is not None:
                 left.append(f"deleting {path}")
                 continue
-            before = raw_bytes(path) if os.path.isfile(path) else None
-            done, said = delete_file(path, ui, self.approve == "auto")
+            try:
+                before = raw_bytes(path) if os.path.isfile(path) else None
+                done, said = delete_file(path, ui, self.approve == "auto")
+            except OSError as error:
+                problem(f"could not delete {path}: {error.strerror or error}")
+                continue
             problems += said
             if done is True:
                 changed[path] = "deleted"
@@ -1650,14 +1802,70 @@ class Session:
 
 # ---------- settings and startup ----------
 
+def strings(value):
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+# What each setting must be: (a test of its value, the words for it in the error).
+KINDS = {
+    "servers": (lambda value: isinstance(value, str) or strings(value), "a URL or a list of URLs"),
+    "model": (lambda value: isinstance(value, str), "text"),
+    "context": (lambda value: value is None or isinstance(value, int), "a whole number or null"),
+    "think": (lambda value: isinstance(value, (bool, str)), 'true, false or a level such as "low"'),
+    "think_max": (lambda value: value is None or isinstance(value, int), "a whole number or null"),
+    "max_out": (lambda value: isinstance(value, int), "a whole number"),
+    "options": (lambda value: isinstance(value, dict), "an object: {...}"),
+    "approve": (lambda value: isinstance(value, str), '"ask" or "auto"'),
+    "run": (strings, "a list of commands"),
+    "instructions": (lambda value: isinstance(value, str), "text"),
+}
+
+
+def current_settings():
+    """The settings in use, by the names they have in the file."""
+    return {"servers": SERVERS, "model": MODEL, "context": CONTEXT, "think": THINK, "think_max": THINK_MAX,
+            "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN, "instructions": INSTRUCTIONS}
+
+
+def apply_settings(settings):
+    """Put these settings in use: all of them, each of the kind it must be."""
+    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, INSTRUCTIONS, RULES
+    servers = settings["servers"]
+    SERVERS = [url.rstrip("/") for url in ([servers] if isinstance(servers, str) else servers)]
+    MODEL, CONTEXT, THINK, THINK_MAX = settings["model"], settings["context"], settings["think"], settings["think_max"]
+    MAX_OUT, OPTIONS, APPROVE = settings["max_out"], settings["options"], settings["approve"]
+    RUN, INSTRUCTIONS = settings["run"], settings["instructions"]
+    RULES = rules()  # so the model knows the commands allowed and the user's instructions
+
+
+def save_setting(name, value):
+    """Change one setting: in the settings file, which keeps whatever else it holds, and in use.
+
+    Raises ValueError when value is not what the setting must be, or the file is no longer
+    valid JSON (it is then left as it is).
+    """
+    fits, kind = KINDS[name]
+    if not fits(value):
+        raise ValueError(f'"{name}" must be {kind}')
+    saved = {}
+    if os.path.isfile(SETTINGS):
+        try:
+            saved = json.loads(read_text(SETTINGS))
+        except ValueError as error:  # not JSON, or not UTF-8
+            raise ValueError(f"{SETTINGS}: {error}") from error
+        if not isinstance(saved, dict):
+            raise ValueError(f"{SETTINGS}: the settings must be one {{...}} object")
+    with open(SETTINGS, "w", encoding="utf-8") as f:
+        f.write(json.dumps({**saved, name: value}, indent=2) + "\n")
+    apply_settings({**current_settings(), name: value})
+
+
 def load_settings(path=SETTINGS):
     """Replace the default settings with those of the file, which is written with the defaults if missing.
 
-    Exits with the error when the file is not valid JSON.
+    Exits with the error when the file is not valid JSON, or a setting is of the wrong kind.
     """
-    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, INSTRUCTIONS, RULES
-    defaults = {"servers": SERVERS, "model": MODEL, "context": CONTEXT, "think": THINK, "think_max": THINK_MAX,
-                "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN, "instructions": INSTRUCTIONS}
+    defaults = current_settings()
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps(defaults, indent=2) + "\n")
@@ -1672,12 +1880,10 @@ def load_settings(path=SETTINGS):
     if unknown:
         print(f"[{path}: unknown settings ignored: {', '.join(unknown)}]")
     settings = {**defaults, **settings}
-    servers = settings["servers"]
-    SERVERS = [url.rstrip("/") for url in ([servers] if isinstance(servers, str) else servers)]
-    MODEL, CONTEXT, THINK, THINK_MAX = settings["model"], settings["context"], settings["think"], settings["think_max"]
-    MAX_OUT, OPTIONS, APPROVE = settings["max_out"], settings["options"], settings["approve"]
-    RUN, INSTRUCTIONS = settings["run"], settings["instructions"]
-    RULES = rules()  # so the model knows the commands allowed and the user's instructions
+    for name, (fits, kind) in KINDS.items():
+        if not fits(settings[name]):
+            sys.exit(f'{path}: "{name}" must be {kind}')
+    apply_settings(settings)
 
 
 def startup():
@@ -1744,7 +1950,11 @@ def main():
         elif question.split()[:1] == ["/model"]:
             choose_model(session, question[6:].strip())
         elif question:
-            session.send(question)
+            try:
+                session.send(question)
+            except KeyboardInterrupt:  # Ctrl+C outside a streamed answer: before it began, or while a command ran
+                session.log = []  # the next call builds the prompt afresh
+                print("\n[stopped]")
 
 
 if __name__ == "__main__":

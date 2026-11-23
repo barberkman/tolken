@@ -10,6 +10,9 @@ Up and Down bring back earlier messages.
 Typing @ suggests project files: Up/Down choose, Tab or Enter inserts.
 Typing / suggests the commands: Up/Down choose, Enter runs one, Tab completes it.
 /model lists the models of llama-server and the Ollama servers; Enter switches to one.
+/settings lists the settings with their values; Enter puts one's value in the input,
+where Enter saves it (in settings.json too) and Esc leaves it as it was. Its model
+row opens the list of models: the one chosen is switched to and started with from then on.
 The model named in settings.json is switched to at startup; without one, the
 first listed (Ollama's come before llama-server's).
 Thinking, when it is on, is shown dim above the answer. The answer is shown as
@@ -38,6 +41,7 @@ import asyncio
 import collections
 import difflib
 import itertools
+import json
 import os
 import random
 import re
@@ -61,6 +65,7 @@ import tolken
 PLACEHOLDER = "Do you remember the Shire, Mr. Frodo? · @file pins code · / for commands"
 COMMANDS = {  # what typing / offers, in this order
     "/model": "choose the model: llama-server's or one of Ollama's",
+    "/settings": "view and change the settings",
     "/undo": "put back the files that the last change of files changed",
     "/clear": "forget the loaded code and the conversation",
     "/exit": "quit",
@@ -69,6 +74,7 @@ EDIT_KEYS = "enter apply · or type what to do instead · esc stop"
 DELETE_KEYS = "enter delete · or type what to do instead · esc stop"
 RUN_KEYS = "enter run · or type what to do instead · esc stop"
 COMMENT_KEYS = "enter send instead · esc stop"  # shown once text is typed while a change waits
+SETTING_KEYS = "enter save · esc cancel"  # shown while the input holds a setting's value
 OUTPUT_LINES = 12  # lines of a command's output shown in its card (the model gets more)
 NEWLINE_KEYS = ("shift+enter", "ctrl+j")  # Shift+Enter only where the terminal reports it; Ctrl+J everywhere
 PHRASES = (  # shown above the input while the model works, in shuffled order, a new one every 10 seconds
@@ -403,6 +409,22 @@ class Answer(Markdown):
                 await (self.append(text[len(shown):]) if text.startswith(shown) else self.update(text))
 
 
+def as_typed(value):
+    """A setting's value as it is typed into the input: text as it is, anything else as JSON."""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def typed_value(text):
+    """The value that text typed for a setting stands for: what it says as JSON, else the text itself."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+AT_WORD = re.compile(r"(?:^|\s)@(\S*)$")  # the @word being typed, at the end of the line before the cursor
+
+
 def matching(files, word, limit=8):
     """The files whose path contains word, best first: file-name matches before folder matches."""
     word = word.lower().replace("\\", "/")
@@ -552,6 +574,9 @@ class TolkenApp(App):
         self.session = tolken.Session(Display(self), size, model)
         self.models = None  # the models on offer while the /model list is open
         self.commands = None  # the command names on offer while the / list is open
+        self.settings = None  # the names of the settings while the /settings list is open
+        self.editing = None  # the setting whose value the input holds, until Enter saves it or Esc leaves it
+        self.as_default = False  # the model list was opened from the settings: the model chosen is saved too
         self.loading = False  # models are being listed or one is being loaded; Esc cannot cancel that
         self.pieces, self.thoughts = collections.deque(), collections.deque()  # streamed answer and thinking not yet on screen
         self.answer, self.answer_text = None, ""  # the widget of the answer being streamed, and its text
@@ -724,6 +749,8 @@ class TolkenApp(App):
         keys = asked if self.asking else "please wait" if self.loading else "esc cancel" if self.busy \
             else "↑↓ choose · enter select · esc close" if self.models is not None \
             else "↑↓ choose · enter run · tab complete · esc close" if self.commands is not None \
+            else "↑↓ choose · enter edit · esc close" if self.settings is not None \
+            else SETTING_KEYS if self.editing \
             else "enter send · shift+enter new line · ctrl+c twice to exit"
         if time.monotonic() < self.hint_until:
             keys = self.hint_text
@@ -762,24 +789,39 @@ class TolkenApp(App):
     def on_text_area_changed(self, event):
         """Suggest commands for a / at the start, or project files for the @word that is being typed.
 
-        Typing also closes the model list.
+        Typing also closes the model list and the settings list.
         """
-        if self.models is not None:
-            self.models, self.activity = None, "ready"
+        if self.editing or self.settings is not None and not self.prompt.value:
+            return  # a setting's value is being typed; or /settings itself has just emptied the input
+        if self.models is not None or self.settings is not None:
+            self.models, self.settings, self.as_default, self.activity = None, None, False, "ready"
         typed = self.prompt.value
         offered = [name for name in COMMANDS if name.startswith(typed)] if re.fullmatch(r"/\S*", typed) else []
         self.commands = offered or None
-        word = re.search(r"(?:^|\s)@(\S*)$", self.prompt.line_before_cursor())
+        word = AT_WORD.search(self.prompt.line_before_cursor())
         if self.commands and not self.asking:
             self.files = None
-            self.matches, self.choice = [f"{name:<8}{COMMANDS[name]}" for name in self.commands], 0
+            self.matches, self.choice = [f"{name:<10}{COMMANDS[name]}" for name in self.commands], 0
         elif word and not self.asking:
-            if self.files is None:  # the list is opening: read the project once
-                self.files = tolken.readable_files()
+            if self.files is None:  # the list is opening: read the project once, in a thread
+                self.files = []  # none to offer until list_files() has read them
+                self.run_worker(self.list_files, thread=True)
             self.matches, self.choice = matching(self.files, word[1]), 0
         else:
             self.files, self.matches = None, []
         self.show_matches()
+
+    def list_files(self):
+        """Runs in a worker thread: read the project's files, which takes long in a large project."""
+        self.session.ui.on_screen(self.offer_files, tolken.readable_files())
+
+    def offer_files(self, files):
+        """Suggest the project's files, now read, for the @word as typed by now; not if the list was closed."""
+        word = AT_WORD.search(self.prompt.line_before_cursor())
+        if self.files is not None and word:
+            self.files = files
+            self.matches, self.choice = matching(files, word[1]), 0
+            self.show_matches()
 
     def show_matches(self):
         lines = [Text(("› " if index == self.choice else "  ") + path, "bold" if index == self.choice else "dim")
@@ -788,8 +830,9 @@ class TolkenApp(App):
         self.suggestions.display = bool(self.matches)
 
     def close_list(self):
-        self.files, self.models, self.commands, self.matches = None, None, None, []
-        if self.activity == "choose a model":
+        self.files, self.models, self.commands, self.settings, self.matches = None, None, None, None, []
+        self.as_default = False
+        if self.activity in ("choose a model", "choose a setting"):
             self.activity = "ready"
         self.show_matches()
         self.tick()  # so the status bar changes at once, not at the next refresh
@@ -814,7 +857,8 @@ class TolkenApp(App):
 
     def complete(self, enter=False):
         """Enter or Tab on the open list: switch to the highlighted model, put the highlighted command
-        in the input, or put the highlighted file in place of the @word before the cursor.
+        or the highlighted setting's value in the input, or put the highlighted file in place of the
+        @word before the cursor.
 
         Returns False when Enter should go on to send the input: no list is open, or a command was
         chosen with Enter, which runs it.
@@ -828,9 +872,17 @@ class TolkenApp(App):
                 self.prompt.value = name if enter else name + " "  # Tab leaves room for what follows the command
             return not enter
         if self.models is not None:
-            model = self.models[self.choice]
+            model, default = self.models[self.choice], self.as_default
             self.close_list()
-            self.run_model(lambda: self.session.use(model), f"loading {model.name}")
+            self.run_model(lambda: self.switch(model, default), f"loading {model.name}")
+            return True
+        if self.settings is not None:
+            name = self.settings[self.choice]
+            self.close_list()
+            if name == "model":  # chosen from the list of models, and switched to as well
+                self.run_model(lambda: self.find_model("", default=True), "listing models")
+            else:
+                self.edit_setting(name)
             return True
         row, column = self.prompt.cursor_location
         start = self.prompt.line_before_cursor().rfind("@") + 1
@@ -843,6 +895,8 @@ class TolkenApp(App):
     def on_prompt_submitted(self, event):
         if self.busy:
             self.hint("still working" if self.loading else "still working · esc cancels")
+        elif self.editing:
+            self.save_edit()
         else:
             pastes = dict(self.prompt.pastes)
             typed, message = self.prompt.take()
@@ -861,6 +915,8 @@ class TolkenApp(App):
             elif message.split()[:1] == ["/model"]:
                 wanted = message[6:].strip()
                 self.run_model(lambda: self.find_model(wanted), "listing models")
+            elif message == "/settings":
+                self.show_settings()
             elif message:
                 self.add("> " + typed, "user")
                 self.conversation.scroll_end(animate=False)
@@ -896,21 +952,34 @@ class TolkenApp(App):
         finally:
             self.session.ui.on_screen(self.model_done)
 
-    def find_model(self, wanted):
-        """Runs in a worker thread: open the model list, or switch straight to the model that wanted names."""
+    def find_model(self, wanted, default=False):
+        """Runs in a worker thread: open the model list, or switch straight to the model that wanted names.
+
+        default: the list is opened from the settings, so the model chosen in it is saved as well.
+        """
         ui, found = self.session.ui, tolken.models()
         if not found:
             ui.note("no model server answers", "bad")
         elif not wanted:
-            ui.on_screen(self.show_models, found)
+            ui.on_screen(self.show_models, found, default)
         elif model := tolken.pick(found, wanted):
             self.session.use(model)
         else:
             ui.note(f"no single model matches {wanted!r}", "bad")
 
-    def show_models(self, found):
+    def switch(self, model, default):
+        """Runs in a worker thread: switch to a model and, with default, save it as the one to start with."""
+        if self.session.use(model) and default:
+            try:
+                self.session.configure("model", model.name)
+            except (ValueError, OSError) as error:
+                self.session.ui.note(str(error), "bad")
+            else:
+                self.session.ui.note(f"{model.name} is the model to start with", "good")
+
+    def show_models(self, found, default=False):
         current, labels = self.session.model.label, [model.label for model in found]
-        self.models = found
+        self.models, self.as_default = found, default
         self.matches = [f"{model.label} · {model.detail}" + "   (current)" * (model.label == current) for model in found]
         self.choice = labels.index(current) if current in labels else 0
         self.show_matches()
@@ -920,8 +989,55 @@ class TolkenApp(App):
             self.header.update(self.header_text())
             self.used = None
         self.busy = self.loading = False
-        self.activity = "choose a model" if self.models is not None else "ready"
+        self.activity = "choose a model" if self.models is not None \
+            else "choose a setting" if self.settings is not None else "ready"
         self.tick()
+
+    # ----- /settings -----
+
+    def show_settings(self, choice=0):
+        """Open the list of the settings with their values, on the one at choice; Enter edits it (see complete)."""
+        values = {name: " ".join(as_typed(value).split()) for name, value in tolken.current_settings().items()}
+        self.settings = list(values)
+        self.matches = [f"{name:<14}{text if len(text) <= 60 else text[:59] + '…'}" for name, text in values.items()]
+        self.choice, self.activity = choice, "choose a setting"
+        self.show_matches()
+        self.tick()
+
+    def edit_setting(self, name):
+        """Put a setting's value in the input box, to be changed there: Enter saves it, Esc leaves it as it was."""
+        self.editing, self.activity = name, "change a setting"
+        with self.prompt.prevent(TextArea.Changed):
+            self.prompt.value = as_typed(tolken.current_settings()[name])
+        self.prompt.border_title = escape(f"{name} · {tolken.KINDS[name][1]}")
+        self.prompt.placeholder = SETTING_KEYS
+        self.prompt.add_class("asking")
+        self.tick()
+
+    def save_edit(self):
+        """Enter while a setting is edited: save what the input holds, or say why it cannot be the setting."""
+        name, value = self.editing, typed_value(self.prompt.value.strip())
+        try:
+            self.session.configure(name, value)
+        except (ValueError, OSError) as error:
+            self.add(f"✗ {error}", "bad")
+            return
+        self.add(f"✓ {name}: {as_typed(value)}", "good")
+        if name == "approve":
+            self.show_approval()
+        self.end_edit()
+        if name == "context":  # the window is set when a model is loaded
+            self.run_model(lambda: self.session.use(self.session.model), f"loading {self.session.model.name}")
+
+    def end_edit(self):
+        """Leave the setting being edited and show the list of them again, on that one."""
+        name, self.editing = self.editing, None
+        with self.prompt.prevent(TextArea.Changed):
+            self.prompt.value = ""
+        self.prompt.border_title = ""
+        self.prompt.placeholder = PLACEHOLDER
+        self.prompt.remove_class("asking")
+        self.show_settings(list(tolken.current_settings()).index(name))
 
     # ----- edits -----
 
@@ -1063,6 +1179,8 @@ class TolkenApp(App):
             self.close_list()
         elif self.asking:
             self.answer_diff(False)
+        elif self.editing:
+            self.end_edit()
         elif self.busy and not self.loading:
             self.activity = "cancelling"
             self.session.cancel()

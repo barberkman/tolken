@@ -2,6 +2,7 @@
 
 The model is replaced by canned answers; no llama-server is needed.
 """
+import json
 import os
 import re
 import tempfile
@@ -556,6 +557,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await self.type(pilot, "look at ")
             self.assertFalse(suggestions.display)
             await self.type(pilot, "@")
+            await self.until(pilot, lambda: self.app.matches)  # the project is listed in a thread
             self.assertTrue(suggestions.display)
             self.assertEqual(self.app.matches, ["a.py", "src/cart.h", "src/cart.cpp", "src/notes.md"])
             await self.type(pilot, "ca")
@@ -575,15 +577,41 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         self.hold = threading.Event()
         async with self.app.run_test() as pilot:
             await self.type(pilot, "@a")
+            await self.until(pilot, lambda: self.app.matches)
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(self.app.prompt.value, "@a.py ")
             self.assertEqual(self.prompts, [])  # Enter chose the file; nothing was sent
             await self.type(pilot, "@")
+            await self.until(pilot, lambda: self.app.matches)
             self.assertTrue(self.app.suggestions.display)
             await pilot.press("escape")
             self.assertFalse(self.app.suggestions.display)
             self.assertEqual(self.app.prompt.value, "@a.py @")
+
+    async def test_the_project_is_listed_for_the_at_sign_without_holding_up_typing(self):
+        listed = threading.Event()
+        self.addCleanup(listed.set)
+
+        def slow():  # a large project
+            listed.wait(5)
+            return ["a.py", "src/cart.cpp", "src/cart.h"]
+
+        with mock.patch.object(tolken, "readable_files", slow):
+            async with self.app.run_test() as pilot:
+                await self.type(pilot, "@ca")
+                self.assertEqual((self.app.prompt.value, self.app.matches), ("@ca", []))  # typed meanwhile
+                listed.set()
+                await self.until(pilot, lambda: self.app.matches)
+                self.assertEqual(self.app.matches, ["src/cart.h", "src/cart.cpp"])  # for the word as it is now
+                await pilot.press("escape")
+                listed.clear()
+                await self.type(pilot, " @")
+                await pilot.press("backspace")  # the @ is taken back before the files are read
+                listed.set()
+                await pilot.pause(0.3)
+                self.assertEqual((self.app.files, self.app.matches), (None, []))
+                self.assertFalse(self.app.suggestions.display)
 
     async def test_shift_enter_and_ctrl_j_start_a_new_line(self):
         self.answers = ["ok"]
@@ -676,6 +704,109 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 await self.until(pilot, lambda: "from small" in self.items())
                 self.assertEqual(small.events, ["enter", "chat"])
                 self.assertEqual(self.prompts, [])  # llama-server's model was not asked
+
+    def keep_settings(self):
+        """Let a test change settings: they are saved in the temporary folder, and put back when it ends."""
+        for name in ("SERVERS", "MODEL", "CONTEXT", "THINK", "THINK_MAX", "MAX_OUT", "OPTIONS", "APPROVE", "RUN",
+                     "INSTRUCTIONS", "RULES", "SETTINGS"):
+            patch = mock.patch.object(tolken, name, "settings.json" if name == "SETTINGS" else getattr(tolken, name))
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def rows(self):
+        return self.app.suggestions.content.plain.split("\n")
+
+    async def test_settings_are_listed_and_one_is_changed_in_the_input(self):
+        self.keep_settings()
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "/settings")
+            await pilot.pause()
+            self.assertEqual(len(self.rows()), 10)
+            self.assertEqual(self.rows()[0], '› servers       ["http://localhost:11434", "http://localhost:8080"]')
+            self.assertEqual((self.rows()[5], self.rows()[7]), ("  max_out       2000", "  approve       ask"))
+            self.assertEqual(self.status().split(" │ ")[0], "choose a setting")
+            self.assertTrue(self.status().endswith("│ ↑↓ choose · enter edit · esc close"))
+            await pilot.press(*["down"] * 5, "enter")
+            await pilot.pause()
+            self.assertEqual((self.app.editing, self.app.prompt.value), ("max_out", "2000"))
+            self.assertEqual(str(self.app.prompt.border_title), "max_out · a whole number")
+            self.assertFalse(self.app.suggestions.display)
+            self.assertTrue(self.status().endswith("│ enter save · esc cancel"))
+            self.app.prompt.value = "8000"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(tolken.MAX_OUT, 8000)
+            with open("settings.json", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"max_out": 8000})
+            self.assertIn("✓ max_out: 8000", self.items())
+            self.assertEqual((self.app.editing, self.app.prompt.value, self.prompts), (None, "", []))
+            self.assertEqual(self.rows()[5], "› max_out       8000")  # the list again, on the setting changed
+            await pilot.press("escape")
+            self.assertFalse(self.app.suggestions.display)
+            self.assertEqual((self.app.settings, self.status().split(" │ ")[0]), (None, "ready"))
+
+    async def test_a_setting_of_the_wrong_kind_is_refused_and_escape_leaves_it_as_it_was(self):
+        self.keep_settings()
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "/settings")
+            await pilot.pause()
+            await pilot.press(*["down"] * 5, "enter")
+            await pilot.pause()
+            self.app.prompt.value = "lots"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn('✗ "max_out" must be a whole number', self.items())
+            self.assertEqual((self.app.editing, self.app.prompt.value, tolken.MAX_OUT), ("max_out", "lots", 2000))
+            self.assertFalse(os.path.exists("settings.json"))
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual((self.app.editing, self.app.prompt.value, tolken.MAX_OUT), (None, "", 2000))
+            self.assertEqual(self.rows()[5], "› max_out       2000")
+            await self.type(pilot, "x")  # typing closes the list, as it closes the model list
+            self.assertEqual((self.app.settings, self.app.suggestions.display), (None, False))
+
+    async def test_changed_settings_take_effect_in_the_running_session(self):
+        self.keep_settings()
+        info = {"default_generation_settings": {"n_ctx": 8192}, "model_path": "demo.gguf"}
+        with mock.patch.object(tolken, "props", lambda url: info):
+            async with self.app.run_test() as pilot:
+                for row, typed in ((7, "auto"), (3, "high"), (2, "4096")):  # approve, think, context
+                    await self.submit(pilot, "/settings")
+                    await pilot.pause()
+                    await pilot.press(*["down"] * row, "enter")
+                    await pilot.pause()
+                    self.app.prompt.value = typed
+                    await pilot.press("enter")
+                    await self.until(pilot, lambda: not self.app.busy)
+                    await pilot.press("escape")
+                self.assertEqual((self.app.session.approve, str(self.app.prompt.border_subtitle)),
+                                 ("auto", "auto · shift+tab"))
+                self.assertEqual((tolken.THINK, tolken.CONTEXT), ("high", 4096))  # text that is not JSON is text
+                self.assertEqual(self.app.session.size, 4096)  # the model was loaded again, with the new window
+                self.assertTrue(str(self.app.header.content).endswith(" · 4,096 tokens"))
+
+    async def test_the_model_chosen_in_the_settings_is_switched_to_and_started_with(self):
+        self.keep_settings()
+        small = FakeModel("small")
+        info = {"default_generation_settings": {"n_ctx": 8192}, "model_path": "demo.gguf"}
+        with mock.patch.object(tolken, "models", lambda: [tolken.Llama(8192, "demo.gguf"), small]), \
+                mock.patch.object(tolken, "props", lambda url: info):
+            async with self.app.run_test() as pilot:
+                await self.submit(pilot, "/settings")
+                await pilot.pause()
+                await pilot.press("down", "enter")  # the model row: it opens the list of models
+                await self.until(pilot, lambda: self.app.models is not None)
+                await pilot.press("down", "enter")
+                await self.until(pilot, lambda: self.app.session.model is small and not self.app.busy)
+                self.assertEqual(tolken.MODEL, "small")
+                with open("settings.json", encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"model": "small"})
+                self.assertIn("✓ small is the model to start with", self.items())
+                await self.submit(pilot, "/model")  # chosen with /model, a model is not saved
+                await self.until(pilot, lambda: self.app.models is not None)
+                await pilot.press("up", "enter")
+                await self.until(pilot, lambda: self.app.session.model is not small and not self.app.busy)
+                self.assertEqual(tolken.MODEL, "small")
 
     async def test_the_model_the_settings_name_is_loaded_at_startup(self):
         small = FakeModel("small")
