@@ -15,6 +15,10 @@ where Enter saves it (in settings.json too) and Esc leaves it as it was. Its mod
 row opens the list of models: the one chosen is switched to and started with from then on.
 The model named in settings.json is switched to at startup; without one, the
 first listed (Ollama's come before llama-server's).
+After an answer the empty input offers a next message, dim, and Tab puts it in the
+input to send or change: "continue", "try again" or "commit the changes" when how
+the message ended makes that plain; else, with the suggest setting at "model", what
+the model expects (asked in a short call of its own, which typing ends).
 Thinking, when it is on, is shown dim above the answer. The answer is shown as
 markdown (headings, lists, tables, highlighted code), each line break kept.
 /undo puts back the files that the last message to change files changed.
@@ -411,7 +415,7 @@ class Answer(Markdown):
 
 def as_typed(value):
     """A setting's value as it is typed into the input: text as it is, anything else as JSON."""
-    return value if isinstance(value, str) else json.dumps(value)
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
 def typed_value(text):
@@ -577,6 +581,8 @@ class TolkenApp(App):
         self.settings = None  # the names of the settings while the /settings list is open
         self.editing = None  # the setting whose value the input holds, until Enter saves it or Esc leaves it
         self.as_default = False  # the model list was opened from the settings: the model chosen is saved too
+        self.suggestion = ""  # the next message offered in the empty input; Tab puts it there
+        self.suggesting = None  # the call that asks the model for one, while it runs
         self.loading = False  # models are being listed or one is being loaded; Esc cannot cancel that
         self.pieces, self.thoughts = collections.deque(), collections.deque()  # streamed answer and thinking not yet on screen
         self.answer, self.answer_text = None, ""  # the widget of the answer being streamed, and its text
@@ -636,6 +642,7 @@ class TolkenApp(App):
 
     def on_unmount(self):
         self.session.cancel()
+        self.stop_suggesting()
         if self.asking:
             self.asking.set()
 
@@ -789,8 +796,9 @@ class TolkenApp(App):
     def on_text_area_changed(self, event):
         """Suggest commands for a / at the start, or project files for the @word that is being typed.
 
-        Typing also closes the model list and the settings list.
+        Typing also closes the model list and the settings list, and ends a call for a suggestion.
         """
+        self.stop_suggesting()
         if self.editing or self.settings is not None and not self.prompt.value:
             return  # a setting's value is being typed; or /settings itself has just emptied the input
         if self.models is not None or self.settings is not None:
@@ -864,6 +872,9 @@ class TolkenApp(App):
         chosen with Enter, which runs it.
         """
         if not self.matches:
+            if not enter and self.suggestion and not (self.prompt.value or self.asking or self.editing):
+                with self.prompt.prevent(TextArea.Changed):  # Tab takes the suggestion; it must not open a list
+                    self.prompt.value = self.suggestion
             return False
         if self.commands is not None:
             name = self.commands[self.choice]
@@ -898,6 +909,7 @@ class TolkenApp(App):
         elif self.editing:
             self.save_edit()
         else:
+            self.stop_suggesting()
             pastes = dict(self.prompt.pastes)
             typed, message = self.prompt.take()
             if typed and (typed, pastes) != (self.history[-1:] or [None])[0]:
@@ -909,15 +921,18 @@ class TolkenApp(App):
                 self.session.clear()
                 self.conversation.remove_children()
                 self.answer, self.answer_text, self.shown, self.used = None, "", None, None
+                self.offer("")
             elif message == "/undo":
                 for note in self.session.undo():
                     self.add(note)
+                self.offer("")
             elif message.split()[:1] == ["/model"]:
                 wanted = message[6:].strip()
                 self.run_model(lambda: self.find_model(wanted), "listing models")
             elif message == "/settings":
                 self.show_settings()
             elif message:
+                self.offer("")
                 self.add("> " + typed, "user")
                 self.conversation.scroll_end(animate=False)
                 self.busy, self.activity, self.call, self.calls = True, "starting", None, 0
@@ -935,12 +950,41 @@ class TolkenApp(App):
     def finished(self):
         self.add(self.summary())
         self.busy, self.activity, self.call = False, "ready", None
+        self.offer(self.session.suggestion if tolken.SUGGEST else "")
+        if tolken.SUGGEST == "model" and not self.suggestion and not self.session.stopped:
+            call = self.suggesting = tolken.Call()  # nothing plain follows: the model is asked, in a thread
+            self.run_worker(lambda: self.session.ui.on_screen(self.suggested, call, self.session.suggest(call)),
+                            thread=True)
         self.tick()
+
+    # ----- the next message, offered in the empty input -----
+
+    def offer(self, text):
+        """Offer text ("" for nothing) as the next message: shown in the empty input, for Tab to take."""
+        self.suggestion = text
+        if not (self.asking or self.editing):  # the input shows their keys; the offer follows (show_placeholder)
+            self.show_placeholder()
+
+    def show_placeholder(self):
+        self.prompt.placeholder = f"{self.suggestion} · tab to use" if self.suggestion else PLACEHOLDER
+
+    def suggested(self, call, text):
+        """The model's suggestion has come; it is offered unless that call was ended meanwhile."""
+        if call is self.suggesting:
+            self.suggesting = None
+            self.offer(text)
+
+    def stop_suggesting(self):
+        """End the call that asks the model for a suggestion, if it runs: the user is doing something else."""
+        if self.suggesting:
+            self.suggesting.cancel()
+            self.suggesting = None
 
     # ----- /model -----
 
     def run_model(self, job, activity):
         """Run job (listing the models, or loading one) in a worker thread, showing activity meanwhile."""
+        self.stop_suggesting()
         self.busy, self.loading, self.activity, self.call = True, True, activity, None
         self.call_started = time.monotonic()
         self.run_worker(lambda: self.model_work(job), thread=True)
@@ -1035,7 +1079,7 @@ class TolkenApp(App):
         with self.prompt.prevent(TextArea.Changed):
             self.prompt.value = ""
         self.prompt.border_title = ""
-        self.prompt.placeholder = PLACEHOLDER
+        self.show_placeholder()
         self.prompt.remove_class("asking")
         self.show_settings(list(tolken.current_settings()).index(name))
 
@@ -1110,7 +1154,7 @@ class TolkenApp(App):
         asked, self.asking = self.asking, None
         self.reply, self.activity = reply, "working"
         self.prompt.border_title = ""
-        self.prompt.placeholder = PLACEHOLDER
+        self.show_placeholder()
         self.prompt.remove_class("asking")
         text, pastes = self.set_aside
         self.set_aside = ("", {})

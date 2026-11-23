@@ -6,12 +6,16 @@
   python bench.py --hard                    the harder tasks, which tell models apart (default: the easy ones)
   python bench.py --runs 1 --tasks create rename
   python bench.py --save report.md
+  python bench.py --settings                with settings.json in place of the benchmark's own settings
 
 Rows: a name as in /model runs that model through tolken. cc:opus or
 cc:opus:xhigh is Claude Code itself, working in the task's folder with its own
 tools. opus or opus:xhigh is Claude inside tolken, on the same prompts as
 the local models and with no tools. A full model name works in place of opus,
 for example cc:claude-opus-4-8:xhigh.
+
+The models run with the settings in SETTINGS below, whatever tolken's own defaults
+and settings.json say, so that the figures stay comparable; --settings changes that.
 
 Every task runs in a throwaway project and the result is checked. Through
 tolken, every edit the model offers is accepted. Claude is reached with the
@@ -29,6 +33,11 @@ import time
 import tolken
 
 WINDOW = 8192  # the context size prompts are built for when a Claude model is used
+# What the models are benchmarked with (BENCHMARKS.md gives its figures for these): thinking off, a low
+# temperature that gives the same kind of answer each time, a short answer. The tests run with them too.
+SETTINGS = {"servers": ["http://localhost:11434", "http://localhost:8080"], "model": "", "context": None,
+            "think": False, "think_max": None, "max_out": 2000, "options": {"temperature": 0.2}, "approve": "ask",
+            "run": ["python -m pytest", "python -m unittest"], "instructions": "", "suggest": "rules"}
 CLAUDE_NAMES = ("opus", "fable", "sonnet", "haiku")  # model names the claude command understands
 
 # ---------- the projects the tasks work in ----------
@@ -810,7 +819,13 @@ def main():
                              + "); the longer ones, " + " ".join(LONG) + ", run only when named")
     parser.add_argument("--runs", type=int, default=3, help="how many times to run each task (default: 3)")
     parser.add_argument("--save", metavar="FILE", help="also write the report to this file")
+    parser.add_argument("--settings", action="store_true",
+                        help="run with settings.json, in place of the benchmark's own settings")
     options = parser.parse_args()
+    if options.settings:
+        tolken.load_settings()
+    else:
+        tolken.apply_settings(SETTINGS)
     tasks = options.tasks or (HARD if options.hard else EASY)
     results, notes = {}, []
     for model in resolve(options.models):

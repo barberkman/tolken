@@ -13,8 +13,11 @@ from unittest import mock
 
 from textual import events
 
+import bench
 import tolken
 import tui
+
+tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
 
 
 def write(path, text):
@@ -708,7 +711,7 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
     def keep_settings(self):
         """Let a test change settings: they are saved in the temporary folder, and put back when it ends."""
         for name in ("SERVERS", "MODEL", "CONTEXT", "THINK", "THINK_MAX", "MAX_OUT", "OPTIONS", "APPROVE", "RUN",
-                     "INSTRUCTIONS", "RULES", "SETTINGS"):
+                     "INSTRUCTIONS", "SUGGEST", "RULES", "SETTINGS"):
             patch = mock.patch.object(tolken, name, "settings.json" if name == "SETTINGS" else getattr(tolken, name))
             patch.start()
             self.addCleanup(patch.stop)
@@ -716,12 +719,18 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
     def rows(self):
         return self.app.suggestions.content.plain.split("\n")
 
+    def test_a_setting_is_shown_and_typed_with_its_own_letters(self):
+        self.assertEqual(tui.as_typed(["çalıştır.cmd", "git status"]), '["çalıştır.cmd", "git status"]')
+        self.assertEqual(tui.as_typed("kısa yanıt"), "kısa yanıt")
+        self.assertEqual(tui.typed_value('["çalıştır.cmd"]'), ["çalıştır.cmd"])
+
     async def test_settings_are_listed_and_one_is_changed_in_the_input(self):
         self.keep_settings()
         async with self.app.run_test() as pilot:
             await self.submit(pilot, "/settings")
             await pilot.pause()
-            self.assertEqual(len(self.rows()), 10)
+            self.assertEqual(len(self.rows()), 11)
+            self.assertEqual(self.rows()[10], "  suggest       rules")
             self.assertEqual(self.rows()[0], '› servers       ["http://localhost:11434", "http://localhost:8080"]')
             self.assertEqual((self.rows()[5], self.rows()[7]), ("  max_out       2000", "  approve       ask"))
             self.assertEqual(self.status().split(" │ ")[0], "choose a setting")
@@ -807,6 +816,86 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("up", "enter")
                 await self.until(pilot, lambda: self.app.session.model is not small and not self.app.busy)
                 self.assertEqual(tolken.MODEL, "small")
+
+    async def test_a_fresh_session_keeps_its_placeholder_and_an_empty_enter_sends_nothing(self):
+        async with self.app.run_test() as pilot:
+            self.assertEqual(self.app.prompt.placeholder, tui.PLACEHOLDER)
+            await pilot.press("tab", "enter")
+            await pilot.pause()
+            self.assertEqual((self.app.prompt.value, self.prompts, self.app.busy), ("", [], False))
+
+    async def test_how_a_message_ended_is_offered_as_the_next_one_and_tab_takes_it(self):
+        going_on = ["Plan first.\nCONTINUE", "Still planning.\nCONTINUE"]
+        self.answers = going_on + ["Planned."] + going_on
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "zzz plan it")
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertEqual(self.app.prompt.placeholder, "continue · tab to use")
+            await pilot.press("enter")  # Enter on the empty input sends nothing, not the suggestion either
+            await pilot.pause()
+            self.assertEqual((self.app.busy, len(self.prompts)), (False, 2))
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertEqual((self.app.prompt.value, self.app.busy, len(self.prompts)), ("continue", False, 2))
+            self.assertFalse(self.app.suggestions.display)
+            await pilot.press("enter")
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertIn("> continue", self.items())
+            self.assertEqual(self.app.prompt.placeholder, tui.PLACEHOLDER)  # "Planned." leaves nothing plain to say
+            await self.submit(pilot, "zzz plan more")
+            await self.until(pilot, lambda: not self.app.busy)
+            self.assertEqual(self.app.prompt.placeholder, "continue · tab to use")
+            await self.submit(pilot, "/clear")
+            await pilot.pause()
+            self.assertEqual(self.app.prompt.placeholder, tui.PLACEHOLDER)
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertEqual(self.app.prompt.value, "")
+
+    async def test_the_model_is_asked_for_the_next_message_when_nothing_plain_follows(self):
+        self.answers = ["It prints old.", "Add a test for it\nThere is none yet.\n", "It does."]
+        stalled, ended, fake = threading.Event(), [], tolken.chat
+
+        def chat(messages, url, ui, session, size=None, think=None):
+            if stalled.is_set() and messages[-1]["content"] == tolken.ASK_NEXT:  # asked, and not answering
+                self.prompts.append(tolken.ASK_NEXT)
+                while not session.stopped:
+                    time.sleep(0.01)
+                ended.append(think)
+                return ""
+            return fake(messages, url, ui, session, size, think)
+
+        with mock.patch.object(tolken, "SUGGEST", "model"), mock.patch.object(tolken, "chat", chat):
+            async with self.app.run_test() as pilot:
+                await self.submit(pilot, "zzz what does it do")
+                await self.until(pilot, lambda: self.app.prompt.placeholder != tui.PLACEHOLDER)
+                self.assertEqual(self.app.prompt.placeholder, "Add a test for it · tab to use")
+                self.assertEqual(self.prompts[-1], tolken.ASK_NEXT)
+                self.assertNotIn("Add a test for it", " ".join(self.items()))  # asked outside the conversation
+                self.assertEqual(len(self.app.session.history), 1)
+                stalled.set()
+                await self.submit(pilot, "zzz is that right")
+                await self.until(pilot, lambda: not self.app.busy and self.prompts[-1] == tolken.ASK_NEXT)
+                self.assertEqual(self.app.prompt.placeholder, tui.PLACEHOLDER)  # the one before went with the message
+                await self.type(pilot, "x")  # typing ends the call: the next message must not wait for it
+                await self.until(pilot, lambda: ended)
+                self.assertEqual((ended, self.app.suggesting), ([False], None))  # asked with thinking off
+                await pilot.press("backspace")
+                await pilot.pause()
+                self.assertEqual((self.app.suggestion, self.app.prompt.placeholder), ("", tui.PLACEHOLDER))
+
+    async def test_only_the_model_setting_makes_the_extra_call_and_false_offers_nothing(self):
+        self.answers = ["It prints old.", "Plan first.\nCONTINUE", "Still planning.\nCONTINUE"]
+        async with self.app.run_test() as pilot:
+            await self.submit(pilot, "zzz what does it do")  # "rules", the default
+            await self.until(pilot, lambda: not self.app.busy)
+            await pilot.pause(0.2)
+            self.assertEqual((len(self.prompts), self.app.prompt.placeholder), (1, tui.PLACEHOLDER))
+            with mock.patch.object(tolken, "SUGGEST", False):
+                await self.submit(pilot, "zzz plan it")
+                await self.until(pilot, lambda: not self.app.busy)
+                await pilot.pause(0.2)
+                self.assertEqual((len(self.prompts), self.app.prompt.placeholder), (3, tui.PLACEHOLDER))
 
     async def test_the_model_the_settings_name_is_loaded_at_startup(self):
         small = FakeModel("small")

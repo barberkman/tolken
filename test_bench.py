@@ -11,6 +11,8 @@ from unittest import mock
 import bench
 import tolken
 
+tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
+
 BLOCK = "FILE: {0}\n<<<<<<< SEARCH\n{1}\n=======\n{2}\n>>>>>>> REPLACE\n"
 FIB = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"
 RENAMED = bench.CART["src/cart.cpp"].replace("sum", "subtotal").strip()
@@ -428,6 +430,21 @@ class Report(unittest.TestCase):
                          ["Claude", "Claude", "ClaudeCode", "ClaudeCode", "ClaudeCode"])
         self.assertEqual((rows[2].effort, rows[3].effort, rows[5].effort), (None, "xhigh", "xhigh"))
         printed.assert_called_once_with("[no single model matches 'nothing'; skipped]")
+
+    def test_the_benchmark_runs_with_its_own_settings_unless_told_to_read_the_file(self):
+        with mock.patch.object(bench, "resolve", return_value=[]), mock.patch("builtins.print"), \
+                mock.patch.object(tolken, "apply_settings") as applied, \
+                mock.patch.object(tolken, "load_settings") as loaded:
+            with mock.patch.object(bench.sys, "argv", ["bench.py"]):
+                bench.main()
+            applied.assert_called_once_with(bench.SETTINGS)
+            loaded.assert_not_called()
+            with mock.patch.object(bench.sys, "argv", ["bench.py", "--settings"]):
+                bench.main()
+            loaded.assert_called_once_with()
+            applied.assert_called_once()  # not again
+        self.assertEqual((bench.SETTINGS["think"], bench.SETTINGS["max_out"], bench.SETTINGS["options"]),
+                         (False, 2000, {"temperature": 0.2}))  # what BENCHMARKS.md says the figures are for
 
 
 if __name__ == "__main__":

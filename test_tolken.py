@@ -15,7 +15,10 @@ import time
 import unittest
 from unittest import mock
 
+import bench
 import tolken
+
+tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
 
 
 def write(path, text):
@@ -1311,6 +1314,89 @@ class Models(InTempDir):
             session.send("zzz two")
         self.assertEqual(len([text for kind, text in self.notes if kind == "warn" and "only the files" in text]), 1)
 
+    def test_how_a_message_ended_suggests_the_next_one(self):
+        edit = "FILE: a.py\n<<<<<<< SEARCH\n{}\n=======\n{}\n>>>>>>> REPLACE\n"
+        ui = mock.Mock()
+        ui.confirm.return_value = True
+
+        def after(*answers, run=("python -m pytest",), cancel=False):
+            """The session after one message that the model answered with these, call by call."""
+            write("a.py", "old\n")
+            session, left = tolken.Session(ui, 8192), list(answers)
+
+            def chat(*_):
+                if cancel:
+                    session.cancel()
+                return left.pop(0)
+
+            with mock.patch.object(tolken, "chat", chat), mock.patch.object(tolken, "count", lambda *_: 10), \
+                    mock.patch.object(tolken, "RUN", list(run)):
+                session.send("zzz change a.py")
+                self.assertEqual(left, [])
+                return session
+
+        self.assertEqual(after("It prints old.").suggestion, "")
+        self.assertEqual(after("Plan first.\nCONTINUE", "Still planning.\nCONTINUE").suggestion, "continue")
+        self.assertEqual(after(*[edit.format("no such line", "x")] * 2).suggestion, "try again")
+        self.assertEqual(after("NEED: missing.py").suggestion, "try again")
+        self.assertEqual(after(edit.format("old", "new") + "DONE").suggestion, "")  # git commit is not allowed
+        session = after(edit.format("old", "new") + "DONE", run=["git commit", "git add"])
+        self.assertEqual(session.suggestion, "commit the changes")
+        session.undo()
+        self.assertEqual(session.suggestion, "")
+        self.assertEqual(after("Plan first.\nCONTINUE", cancel=True).suggestion, "")
+
+    def test_the_model_is_asked_for_the_next_message_outside_the_conversation(self):
+        session, seen, reply = tolken.Session(self.ui), [], ['"Add a test for parse_duration."\nIt has none yet.\n']
+        model = session.model = FakeModel("fake")
+
+        def chat(messages, ui=None, call=None, think=None):
+            seen.append((messages, think))
+            return reply[0]
+
+        model.chat = chat
+        self.assertEqual((session.suggest(), seen), ("", []))  # no conversation to go on from: nothing is asked
+        log = [{"role": "system", "content": "rules"}, {"role": "user", "content": "q"},
+               {"role": "assistant", "content": "a"}]
+        session.log, session.history = list(log), [("q", "a")]
+        self.assertEqual(session.suggest(), "Add a test for parse_duration.")
+        messages, think = seen[0]
+        self.assertEqual((messages[:3], messages[3]["role"], think), (log, "user", False))
+        self.assertIn("most likely to send next", messages[3]["content"])
+        self.assertEqual((session.log, session.history), (log, [("q", "a")]))  # the conversation is as it was
+        for unfit in ("", "FILE: a.py\n<<<<<<< SEARCH\n", "NEED: a.py", "DONE", "x" * 81):
+            reply[0] = unfit
+            self.assertEqual(session.suggest(), "", unfit)
+        model.chat = mock.Mock(side_effect=OSError("the server is down"))
+        self.assertEqual(session.suggest(), "")
+        model.chat, model.count = chat, lambda messages: 10 ** 9  # no room for the question
+        seen.clear()
+        self.assertEqual((session.suggest(), seen), ("", []))
+
+    def test_the_call_for_a_suggestion_ends_after_its_first_line(self):
+        read = []
+
+        class Lines:
+            """A streamed answer that would go on for a thousand lines."""
+
+            fp = None
+
+            def __iter__(self):
+                for number in range(1000):
+                    read.append(number)
+                    yield b"data: " + json.dumps({"choices": [{"delta": {"content": f"line {number}\n"}}]}).encode()
+
+            def close(self):
+                pass
+
+        session = tolken.Session(self.ui)
+        session.model = FakeModel("fake")
+        session.model.chat = lambda messages, ui=None, call=None, think=None: tolken.stream(
+            Lines(), tolken.llama_line, ui, call)
+        session.log = [{"role": "system", "content": "rules"}, {"role": "user", "content": "q"}]
+        self.assertEqual(session.suggest(), "line 0")
+        self.assertLess(len(read), 5)
+
     def test_a_call_cancelled_before_its_answer_is_not_reported_as_a_server_error(self):
         model, session = FakeModel("fake"), tolken.Session(self.ui)
 
@@ -1560,7 +1646,7 @@ class Settings(InTempDir):
     def setUp(self):
         super().setUp()
         for name in ("SERVERS", "MODEL", "CONTEXT", "THINK", "THINK_MAX", "MAX_OUT", "OPTIONS", "APPROVE", "RUN",
-                     "INSTRUCTIONS", "RULES"):
+                     "INSTRUCTIONS", "SUGGEST", "RULES"):
             patch = mock.patch.object(tolken, name, getattr(tolken, name))  # put back what load_settings changes
             patch.start()
             self.addCleanup(patch.stop)
@@ -1573,7 +1659,7 @@ class Settings(InTempDir):
                                             "max_out": 2000,
                                             "options": {"temperature": 0.2}, "approve": "ask",
                                             "run": ["python -m pytest", "python -m unittest"],
-                                            "instructions": ""})
+                                            "instructions": "", "suggest": "rules"})
         self.assertIn("[wrote the default settings to settings.json]", self.printed.getvalue())
 
     def test_without_instructions_the_rules_end_with_the_running_part(self):
@@ -1600,7 +1686,8 @@ class Settings(InTempDir):
 
     def test_a_setting_of_the_wrong_kind_exits_naming_it(self):
         for settings, name in (({"run": "python -m pytest"}, "run"), ({"max_out": "2000"}, "max_out"),
-                               ({"servers": [8080]}, "servers"), ({"think": 1}, "think"), ({"context": "8k"}, "context")):
+                               ({"servers": [8080]}, "servers"), ({"think": 1}, "think"), ({"context": "8k"}, "context"),
+                               ({"suggest": True}, "suggest")):
             write("settings.json", json.dumps(settings))
             with self.assertRaises(SystemExit) as caught:
                 tolken.load_settings("settings.json")
@@ -1616,6 +1703,13 @@ class Settings(InTempDir):
         self.assertEqual((tolken.MAX_OUT, tolken.RUN), (8000, ["build.cmd"]))
         self.assertEqual(tolken.current_settings()["max_out"], 8000)
         self.assertIn("These commands are allowed (arguments may follow them): build.cmd.", tolken.RULES)
+
+    def test_a_setting_is_saved_with_its_own_letters(self):
+        with mock.patch.object(tolken, "SETTINGS", "settings.json"):
+            tolken.save_setting("instructions", "Türkçe yanıt ver; çıktıyı kısa tut.")
+            self.assertIn("Türkçe yanıt ver; çıktıyı kısa tut.".encode("utf-8"), read_bytes("settings.json"))
+            tolken.load_settings("settings.json")  # and read back as it was
+        self.assertEqual(tolken.INSTRUCTIONS, "Türkçe yanıt ver; çıktıyı kısa tut.")
 
     def test_a_value_of_the_wrong_kind_or_a_broken_file_is_not_saved(self):
         write("settings.json", '{"max_out": 4000}')

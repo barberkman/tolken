@@ -149,10 +149,10 @@ python bench.py --runs 1 --tasks fix time --save report.md
 python bench.py --tasks recall large --models bonsai-2:27b   # the longer tasks, several messages each
 ```
 
-`bench.py` does not read `settings.json`. The thinking row and the 64k rows were run with the settings loaded first:
+`bench.py` runs with settings of its own (thinking off, temperature 0.2, `max_out` 2,000), whatever `settings.json` and tolken's defaults say. The thinking row and the 64k rows were run with `settings.json` in their place:
 
 ```
-python -c "import sys, tolken, bench; tolken.load_settings(); sys.argv[1:] = ['--hard', '--models', 'bonsai-2:27b']; bench.main()"
+python bench.py --hard --models bonsai-2:27b --settings
 ```
 
 Without `--hard` it runs the easy set. Stop llama-server before benchmarking Ollama models, and the other way round, or the two will share the GPU and the speed figures will be wrong.

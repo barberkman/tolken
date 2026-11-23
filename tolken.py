@@ -41,6 +41,10 @@ for the session that is running. Keys left out keep their defaults:
                   command, and every command in "ask", waits for the user
   instructions    text added to the end of the system prompt, for every project:
                   "Before ending with DONE, run RUN: build.cmd and fix what fails"
+  suggest         what the full-screen interface offers as the next message, in the
+                  empty input, for Tab to take: "rules" for what follows plainly from
+                  how the last message ended ("continue", "commit the changes"),
+                  "model" to ask the model as well when nothing does, false for nothing
 
 Every prompt carries the project's file list. A pinned file also brings the
 project files it #includes, while they fit. Without a pin, the words of the
@@ -93,17 +97,23 @@ import urllib.parse
 import urllib.request
 
 SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-# The defaults of the settings; load_settings() replaces them with those of the file.
-SERVERS = ["http://localhost:11434", "http://localhost:8080"]  # Ollama's and llama-server's
-MODEL = ""              # the model to start with, named as for /model; "" for the first one listed
-CONTEXT = None          # context window in tokens; None for what the server gives
-THINK = False           # False, True, or a level: "low", "medium" or "high"
+# The defaults of the settings; load_settings() replaces them with those of the file, and writes them
+# to the file when there is none.
+SERVERS = ["http://169.254.51.51:11434", "http://127.0.0.1:8080"]  # an Ollama server's and llama-server's
+MODEL = "bonsai-2:27b"  # the model to start with, named as for /model; "" for the first one listed
+CONTEXT = 131072        # context window in tokens; None for what the server gives
+THINK = True            # False, True, or a level: "low", "medium" or "high"
 THINK_MAX = None        # tokens of thinking after which the model is asked again without thinking; None for no cap
-OPTIONS = {"temperature": 0.2}  # sent to the server as they are; a low temperature gives the same kind of answer each time
-MAX_OUT = 2000          # tokens reserved for the answer, thinking included
+OPTIONS = {"temperature": 0.6}  # sent to the server as they are
+MAX_OUT = 16000         # tokens reserved for the answer, thinking included
 APPROVE = "ask"         # "ask": each change waits for the user; "auto": changes are made at once (anything else asks)
-RUN = ["python -m pytest", "python -m unittest"]  # commands allowed to run; arguments may follow
-INSTRUCTIONS = ""       # the user's own text, added to the end of the system prompt
+# The commands allowed to run; arguments may follow.
+RUN = ["build.cmd", "git status", "git diff", "git log", "git show", "git add", "git commit"]
+# The user's own text, added to the end of the system prompt.
+INSTRUCTIONS = ("After your changes, before ending with DONE, run RUN: build.cmd and fix any errors it reports.\n"
+                "Git: you may read the repository with RUN: git status, RUN: git diff, RUN: git log and RUN: git show."
+                " Commit only when the user asks: write RUN: git add followed by the files, then RUN: git commit -m \"message\", with the message on one line, in double quotes, and without % & ; or backquotes.")
+SUGGEST = "model"       # the next message offered in the empty input: False, "rules", or "model" (which asks the model too)
 RUN_TIMEOUT = 120       # seconds a command may run before it is stopped
 RUN_CHARS = 3000        # characters of a command's output the model gets, per 8,192 tokens of window
 SEARCH_TOKENS = 4000    # at most this much automatically found code per question, however large the window
@@ -1393,6 +1403,7 @@ class Session:
         # For /undo: path -> [bytes before (None: it was created), bytes after (None: deleted), folders created],
         # for the last message that changed files; fresh: the running message has changed none yet.
         self.saved, self.fresh = {}, True
+        self.suggestion = ""  # the user's likely next message, where how the last one ended makes it plain; see send()
 
     def remember(self, path, before, folders):
         """Keep what path held before this message first changed it, and what it holds now, for /undo."""
@@ -1425,7 +1436,7 @@ class Session:
                     f.write(before)
                 notes.append(f"put back {path}" if after is not None else f"restored {path}, which was deleted")
             undone.append(path)
-        self.saved = {}
+        self.saved, self.suggestion = {}, ""
         if undone:
             self.untold.append(f"the user undid your changes to: {', '.join(undone)}")
         return notes
@@ -1461,6 +1472,24 @@ class Session:
         self.logged, self.listed = {tuple(entry): snippet(entry) for entry in shown}, set(files)
         return messages, used, ("rebuilt: " if self.log else "") + (", ".join(map(label, shown)) or "no code")
 
+    def suggest(self, call=None):
+        """The user's likely next message, asked of the model in a short call outside the conversation; "" for none.
+
+        The call continues the last one's prompt, which the server has cached, with ASK_NEXT, and
+        is ended after the first line of the answer. Nothing of it is kept in the conversation.
+        call is a Call through which another thread can end it (the user has begun to type).
+        """
+        call = call or Call()
+        messages = self.log + [{"role": "user", "content": ASK_NEXT}]
+        try:
+            if not self.log or self.model.count(messages) + MARGIN > self.size - answer_room(self.size):
+                return ""
+            answer = self.model.chat(messages, Brief(call), call, think=False)
+        except (OSError, ValueError):  # the server cannot be reached, or sent what could not be read
+            return ""
+        line = (answer.strip().splitlines() or [""])[0].strip(" \t\"'`*")
+        return "" if not line or len(line) > 80 or NOT_A_MESSAGE.match(line) else line
+
     def cancel(self):
         """End the running call or command. Meant to be called from another thread; send() then stops."""
         self.stopped = True
@@ -1494,7 +1523,7 @@ class Session:
         The file list and the earlier exchanges kept then grow with the window.
         """
         ui, size = self.ui, self.size
-        self.stopped, self.fresh = False, True
+        self.stopped, self.fresh, self.suggestion = False, True, ""
         ui.activity("searching project")
         self.ctx = self.visible([entry for entry in self.ctx if os.path.isfile(entry[0])])
         for pin in self.visible(parse_pins(question)):
@@ -1547,6 +1576,7 @@ class Session:
             self.ctx = found
         answer, full, idle = "", False, 0  # full: no room is left for more files; idle: answers in a row that did nothing
         more, progress = None, {}  # whether the model has more to do; the files this message changed so far
+        problems, declined = [], []  # of the last answer: what could not be done, and what the user said no to
         for call in itertools.count(1):
             try:
                 pinned = [entry for entry in self.ctx if entry in self.pins]
@@ -1650,12 +1680,16 @@ class Session:
         if self.stopped:
             ui.note("cancelled")
             return
-        if re.search(r"^NEED:", prose(answer), re.M):
+        wants = re.search(r"^NEED:", prose(answer), re.M)
+        if wants:
             ui.note("the model still wants files; pin the part it needs with @file:START-END, "
                     "or reply to let it try again")
         elif more:
             ui.note(f"stopped after {MAX_CALLS} calls; reply to let the model go on" if call == MAX_CALLS
                     else "the model wanted to go on; reply to let it continue")
+        # What the user will most likely say next, where that is plain from how the message ended.
+        self.suggestion = ("continue" if more else "try again" if wants or problems and not declined
+                           else "commit the changes" if not self.fresh and listed("git commit") else "")
 
     def widen(self, paths):
         """Show the files at paths, just edited, whole from now on: a line range of one was for its old lines.
@@ -1800,6 +1834,43 @@ class Session:
         return changed, problems, declined, comment
 
 
+ASK_NEXT = ("Write the message the user is most likely to send next, in at most ten words. "
+            "Reply with only that message.")  # what Session.suggest() asks
+NOT_A_MESSAGE = re.compile(r"NEED:|RUN:|DELETE:|FILE:|DONE\b|CONTINUE\b|<{5}")  # tolken's own lines, not a user's
+
+
+class Call:
+    """What post() and stream() need of a session, for a call outside the conversation: where its socket is
+    kept, and whether it was cancelled."""
+
+    sock, stopped, process = None, False, None  # process: a command; such a call runs none
+    cancel = Session.cancel  # sets stopped and closes the socket, which is all of a session it uses
+
+
+class Brief:
+    """The ui of a call that is to give one line: it ends the call once a line has come, or the model goes
+    on for long without one, or keeps thinking although told not to."""
+
+    def __init__(self, call):
+        self.call, self.said, self.pieces = call, "", 0
+
+    def text(self, piece):
+        self.said, self.pieces = self.said + piece, self.pieces + 1
+        if "\n" in self.said.lstrip() or self.pieces >= 40:
+            self.call.stopped = True
+
+    def thinking(self, piece):
+        self.pieces += 1
+        if self.pieces >= 200:
+            self.call.stopped = True
+
+    def timings(self, data):
+        pass
+
+    def note(self, text, kind="info"):
+        pass
+
+
 # ---------- settings and startup ----------
 
 def strings(value):
@@ -1818,23 +1889,25 @@ KINDS = {
     "approve": (lambda value: isinstance(value, str), '"ask" or "auto"'),
     "run": (strings, "a list of commands"),
     "instructions": (lambda value: isinstance(value, str), "text"),
+    "suggest": (lambda value: value is False or value in ("rules", "model"), 'false, "rules" or "model"'),
 }
 
 
 def current_settings():
     """The settings in use, by the names they have in the file."""
     return {"servers": SERVERS, "model": MODEL, "context": CONTEXT, "think": THINK, "think_max": THINK_MAX,
-            "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN, "instructions": INSTRUCTIONS}
+            "max_out": MAX_OUT, "options": OPTIONS, "approve": APPROVE, "run": RUN, "instructions": INSTRUCTIONS,
+            "suggest": SUGGEST}
 
 
 def apply_settings(settings):
     """Put these settings in use: all of them, each of the kind it must be."""
-    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, INSTRUCTIONS, RULES
+    global SERVERS, MODEL, CONTEXT, THINK, THINK_MAX, MAX_OUT, OPTIONS, APPROVE, RUN, INSTRUCTIONS, SUGGEST, RULES
     servers = settings["servers"]
     SERVERS = [url.rstrip("/") for url in ([servers] if isinstance(servers, str) else servers)]
     MODEL, CONTEXT, THINK, THINK_MAX = settings["model"], settings["context"], settings["think"], settings["think_max"]
     MAX_OUT, OPTIONS, APPROVE = settings["max_out"], settings["options"], settings["approve"]
-    RUN, INSTRUCTIONS = settings["run"], settings["instructions"]
+    RUN, INSTRUCTIONS, SUGGEST = settings["run"], settings["instructions"], settings["suggest"]
     RULES = rules()  # so the model knows the commands allowed and the user's instructions
 
 
@@ -1856,7 +1929,7 @@ def save_setting(name, value):
         if not isinstance(saved, dict):
             raise ValueError(f"{SETTINGS}: the settings must be one {{...}} object")
     with open(SETTINGS, "w", encoding="utf-8") as f:
-        f.write(json.dumps({**saved, name: value}, indent=2) + "\n")
+        f.write(json.dumps({**saved, name: value}, indent=2, ensure_ascii=False) + "\n")  # letters as they are
     apply_settings({**current_settings(), name: value})
 
 
