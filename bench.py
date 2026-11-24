@@ -826,6 +826,7 @@ def main():
         tolken.load_settings()
     else:
         tolken.apply_settings(SETTINGS)
+    tolken.LOGS = None  # a session for each task would push out the logs of the user's own work
     tasks = options.tasks or (HARD if options.hard else EASY)
     results, notes = {}, []
     for model in resolve(options.models):

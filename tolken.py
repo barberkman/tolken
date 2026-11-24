@@ -78,6 +78,13 @@ its edits are made. It runs without a shell (shell syntax is refused, since a
 .cmd or .bat file runs in cmd.exe) in the project folder for at most
 RUN_TIMEOUT seconds, and the start and end of its output go back to the model,
 which is then called again.
+
+Every call of the model is logged, to look into later what it was sent and what
+it answered: a file for each session in the logs folder next to this file, a
+JSON line for each call with the messages the call added to the prompt, the
+model's thinking and its answer as it came, and a line with what the answer
+led to (the edits made, what could not be done, the commands' output). The
+newest KEEP_LOGS files are kept.
 """
 import concurrent.futures
 import difflib
@@ -97,6 +104,9 @@ import urllib.parse
 import urllib.request
 
 SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+# The folder the model's calls are logged in, a file for each session (see Session.keep); None for no log.
+LOGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+KEEP_LOGS = 30          # the newest log files kept; older ones are deleted when a new one is begun
 # The defaults of the settings; load_settings() replaces them with those of the file, and writes them
 # to the file when there is none.
 SERVERS = ["http://169.254.51.51:11434", "http://127.0.0.1:8080"]  # an Ollama server's and llama-server's
@@ -141,6 +151,13 @@ like just also
 """.split())
 
 EXAMPLE_PATH = "<path>"  # stands for a real path in RULES; an edit that still has angle brackets is refused
+# How a change is written: part of the rules, and shown again when a block could not be read.
+FORM = f"""FILE: {EXAMPLE_PATH}
+<<<<<<< SEARCH
+existing lines to replace, copied exactly, as few as possible
+=======
+new lines
+>>>>>>> REPLACE"""
 WRITING = f"""You are a coding assistant working inside the user's project folder; its files are listed below. You can read, create and change files in it. Answer briefly.
 
 Reading: you only see the contents of files shown in the conversation; do not guess what a file contains from its name. A file shown again replaces its earlier copy; when only its changed parts are shown, the rest of it is as before. When a question is about the project's existing code and you need files that are not shown, reply with only this line:
@@ -149,12 +166,7 @@ The files will then be shown to you. Ask for whole files; add :START-END to a pa
 
 Writing: when asked to create or change files, do it yourself with edit blocks; they are applied for you after the user confirms. Never say you cannot create or edit files. Each change is a FILE: line and a block, where {EXAMPLE_PATH} is the file's path relative to the project folder:
 
-FILE: {EXAMPLE_PATH}
-<<<<<<< SEARCH
-existing lines to replace, copied exactly, as few as possible
-=======
-new lines
->>>>>>> REPLACE
+{FORM}
 
 To create a new file, leave SEARCH empty; put it directly in the project folder unless the user names a place.
 To delete or remove a file, do not use a block; write this line for it:
@@ -179,7 +191,8 @@ RULES = rules()  # the system prompt; load_settings() builds it again with the s
 
 NO_CODE = "(No file contents have been shown yet.)"  # stands where the code would be
 GO_ON = ("Continue the task. The latest copy of each file above, with the changed parts shown after it, "
-         "is as it is now. If the task is finished, reply with only DONE.")  # follows the results of the model's edits
+         "is as it is now. Give each change as a FILE: line and a block of <<<<<<< SEARCH, ======= and "
+         ">>>>>>> REPLACE lines. If the task is finished, reply with only DONE.")  # follows the results of the model's edits
 
 # The path line is left out when a block follows another one for the same file. A block's text never runs
 # past the next <<<<<<< SEARCH line, so a block left open is dropped, not run into the next one. Small
@@ -753,8 +766,9 @@ def stream(response, read, ui=PLAIN, session=None):
     The session also learns whether the model thought (session.thought) and whether the answer
     was cut off at its length limit (session.cut). When the session has a think_max, the stream
     ends after that many pieces of thinking (a piece is about a token) and session.overthought is set.
+    The thinking itself is left in session.thinking, for the log.
     """
-    pieces, thinking, cap = [], 0, getattr(session, "think_max", None)
+    pieces, thoughts, cap = [], [], getattr(session, "think_max", None)
     if session:
         session.sock = getattr(getattr(response.fp, "raw", None), "_sock", None)
     try:
@@ -770,8 +784,8 @@ def stream(response, read, ui=PLAIN, session=None):
                 ui.thinking(thought)
                 if session:
                     session.thought = True
-                thinking += 1
-                if cap and thinking >= cap:
+                thoughts.append(thought)
+                if cap and len(thoughts) >= cap:
                     session.overthought = True
                     break
             if piece:
@@ -788,7 +802,7 @@ def stream(response, read, ui=PLAIN, session=None):
             raise OSError(f"the answer was cut off ({error})") from error
     finally:
         if session:
-            session.sock = None
+            session.sock, session.thinking = None, "".join(thoughts)
         response.close()
     ui.text("\n")
     return "".join(pieces)
@@ -1091,6 +1105,20 @@ def parse_edits(answer):
     return [(path, block[2].removesuffix("\n"), block[3].removesuffix("\n")) for block, path in edit_blocks(answer)]
 
 
+def unread_blocks(answer):
+    """What each <<<<<<< SEARCH line of an answer that began no block lacks: the blocks edit_blocks() does not find."""
+    read = [block.span() for block, _ in edit_blocks(answer)]
+    starts = [mark.start() for mark in re.finditer(r"^<{5,9} SEARCH", answer, re.M)]
+    lacks = []
+    for start, end in zip(starts, starts[1:] + [len(answer)]):
+        if not any(first <= start < last for first, last in read):
+            text = answer[start:end]  # up to the next block
+            lacks.append("text after <<<<<<< SEARCH on its line" if not re.match(r"<{5,9} SEARCH[ \t]*\n", text)
+                         else "no >>>>>>> REPLACE line at its end" if re.search(r"^={5,9}[ \t]*$", text, re.M)
+                         else "no ======= line between the old and the new lines")
+    return lacks
+
+
 def places(lines, old_lines, key):
     """Where old_lines start in lines, compared after key: str, or str.strip to ignore indentation."""
     want = [key(line) for line in old_lines]
@@ -1355,6 +1383,8 @@ class Session:
         self.approve = APPROVE  # "ask" or "auto"; Shift+Tab in the full-screen interface switches it
         self.cut = self.thought = False  # whether the last answer hit max_out, and whether the model thought
         self.overthought = False  # whether the last answer's thinking reached think_max
+        self.thinking = ""  # the last answer's thinking, which stream() leaves here
+        self.journal = None  # this session's file in LOGS, named at its first call; False once it could not be written
         self.untracked = True  # whether git listed the untracked files at the last message; see git_files()
         self.clear()
 
@@ -1390,6 +1420,24 @@ class Session:
             self.approve = value
         elif name in ("run", "instructions"):
             self.log = []  # the system prompt has changed: the next call builds the prompt afresh
+
+    def keep(self, **record):
+        """Add one line to this session's log file. The first line begins the file, and the oldest files beyond
+        KEEP_LOGS are deleted then. A log that cannot be written is given up, so that it never ends a message."""
+        if not LOGS or self.journal is False:
+            return
+        try:
+            if not self.journal:
+                os.makedirs(LOGS, exist_ok=True)
+                for old in sorted(name for name in os.listdir(LOGS) if name.endswith(".jsonl"))[:1 - KEEP_LOGS]:
+                    os.remove(os.path.join(LOGS, old))
+                self.journal = os.path.join(LOGS, f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.jsonl")
+            # Letters as they are; half a surrogate pair, which UTF-8 cannot hold, as the escape JSON has for it.
+            with open(self.journal, "a", encoding="utf-8", errors="backslashreplace", newline="") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as error:
+            self.journal = False
+            self.ui.note(f"could not write the log in {LOGS}: {error.strerror or error}", "warn")
 
     def clear(self):
         """Forget the loaded code and the conversation."""
@@ -1591,6 +1639,7 @@ class Session:
                 ui.note(f"{sent} | {used}/{size} tokens")
                 ui.activity("waiting for model", call, used)
                 self.cut = self.thought = self.overthought = False  # set by stream() while the answer arrives
+                self.thinking = ""
                 answer = self.model.chat(messages, ui, self)
                 if (self.overthought or self.cut and self.thought) and not self.stopped:
                     # Thinking took the room the answer needed: the same prompt (cached) again, without it.
@@ -1605,6 +1654,13 @@ class Session:
                                 "raise think_max in settings.json", "bad")
                 if self.cut and not self.stopped:
                     ui.note(f"the answer reached max_out ({answer_room(size):,} tokens) and was cut off", "warn")
+                # Logged before anything is done with the answer: the messages this call added to the last one's.
+                added = messages[len(self.log):] if self.log and messages[:len(self.log)] == self.log else messages
+                self.keep(time=time.strftime("%Y-%m-%dT%H:%M:%S"), project=os.getcwd(), model=self.model.label,
+                          call=call, whole=added is messages,
+                          messages=[{**message, "images": len(message["images"])} if "images" in message else message
+                                    for message in added],
+                          thinking=self.thinking, answer=answer, cut=self.cut)
                 self.log = messages + [{"role": "assistant", "content": answer}]
                 self.untold = []  # the prompt told it
             except urllib.error.HTTPError as error:
@@ -1636,6 +1692,8 @@ class Session:
             ran, refused, comment = ([], [], comment) if declined else self.run(said)
             declined += refused
             report = [f"{done} {path}" for path, done in changed.items()] + problems + ran + declined
+            if report:
+                self.keep(report=report)
             # Kept for the next message unless a call of this one tells it; only what the model cannot assume.
             self.untold = report if problems or ran or declined else []
             if self.stopped:
@@ -1773,9 +1831,12 @@ class Session:
         edits = {}
         for path, search_text, replace in parse_edits(answer):
             edits.setdefault(path, []).append((search_text, replace))
-        unread = len(re.findall(r"^<{5,9} SEARCH", answer, re.M)) - sum(map(len, edits.values()))
+        unread = unread_blocks(answer)
         if unread:
-            problem(f"{unread} edit block(s) could not be read and were ignored; a block ends with >>>>>>> REPLACE")
+            lacks = "; ".join(f"{unread.count(lack)} with {lack}" for lack in dict.fromkeys(unread))
+            text = f"{len(unread)} edit block(s) could not be read and were ignored: {lacks}"
+            ui.note(text, "bad")
+            problems.append(f"{text}. Write each change like this:\n{FORM}")  # the model is shown the form again
         removals = deletions(prose(answer))
         for path, blocks in edits.items():
             if comment is not None:
