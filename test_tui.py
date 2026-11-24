@@ -1029,10 +1029,9 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await self.until(pilot, lambda: not self.app.busy)
             self.assertTrue(self.app.session.history)
             await self.submit(pilot, "/clear")
-            await pilot.pause()
+            await self.until(pilot, lambda: self.status().startswith("ready │ 0/8,192"))  # tick() redraws it
             self.assertEqual(self.items(), [])
             self.assertEqual(self.app.session.history, [])
-            self.assertTrue(self.status().startswith("ready │ 0/8,192"))
             await self.submit(pilot, "/exit")
             await pilot.pause()
             self.assertFalse(self.app.is_running)
