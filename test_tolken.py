@@ -19,6 +19,7 @@ import bench
 import tolken
 
 tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
+tolken.LOGS = None  # the tests' calls are not logged
 
 
 def write(path, text):
@@ -278,9 +279,31 @@ class Edits(InTempDir):
         write("b.py", "x\n")
         session = tolken.Session(mock.Mock())
         session.approve = "auto"
+        unread = ("1 edit block(s) could not be read and were ignored: "
+                  "1 with no ======= line between the old and the new lines")
         self.assertEqual(session.apply(broken + good), ({"b.py": "applied"}, [
-            "1 edit block(s) could not be read and were ignored; a block ends with >>>>>>> REPLACE"], [], None))
+            f"{unread}. Write each change like this:\n{tolken.FORM}"], [], None))  # the model is shown the form again
+        session.ui.note.assert_any_call(unread, "bad")
+        self.assertIn(tolken.FORM, tolken.RULES)
         self.assertEqual((read_bytes("a.py"), read_bytes("b.py")), (b"old\n", b"y\n"))
+
+    def test_an_unread_block_is_told_by_what_it_lacks(self):
+        good = "FILE: b.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n"
+        divider, end = "no ======= line between the old and the new lines", "no >>>>>>> REPLACE line at its end"
+        for broken, reason in (("<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n", divider),
+                               ("<<<<<<< SEARCH\nold\n====\nnew\n>>>>>>> REPLACE\n", divider),
+                               ("<<<<<<< SEARCH\nold\n======= REPLACE\nnew\n>>>>>>> REPLACE\n", divider),
+                               ("<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\nnew\n>>>>>>> REPLACE\n", divider),
+                               ("<<<<<<< SEARCH a.py\nold\n=======\nnew\n>>>>>>> REPLACE\n",
+                                "text after <<<<<<< SEARCH on its line"),
+                               ("<<<<<<< SEARCH\nold\n=======\nnew\n", end)):
+            self.assertEqual(tolken.unread_blocks("FILE: a.py\n" + broken + good), [reason], broken)
+        self.assertEqual(tolken.unread_blocks(good + "FILE: a.py\n<<<<<<< SEARCH\none\n=======\n1\n=======\n"), [])
+        session = tolken.Session(mock.Mock())
+        _, problems, _, _ = session.apply("<<<<<<< SEARCH\na\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nb\n>>>>>>> REPLACE\n"
+                                          "<<<<<<< SEARCH\nc\n=======\nd\n" + good.replace("b.py", "../b.py"))
+        self.assertTrue(problems[0].startswith(f"3 edit block(s) could not be read and were ignored: 2 with {divider}; "
+                                               f"1 with {end}. "), problems[0])
 
     def test_a_second_divider_ends_a_block_that_has_no_end_marker(self):
         answer = ("FILE: a.py\n<<<<<<< SEARCH\none\n=======\n1\n=======\n"
@@ -1642,6 +1665,78 @@ class Models(InTempDir):
         self.assertIn("[no model server answers]", self.printed.getvalue())
 
 
+class Logs(InTempDir):
+    """The log of the model's calls, with the model replaced by canned answers."""
+
+    EDIT, run_main, continues = Rounds.EDIT, Rounds.run_main, Rounds.continues
+
+    def setUp(self):
+        super().setUp()
+        folder = tempfile.TemporaryDirectory()  # not in the project folder, whose files are listed in the prompt
+        self.addCleanup(folder.cleanup)
+        self.folder = folder.name
+        patch = mock.patch.object(tolken, "LOGS", self.folder)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def lines(self):
+        """The lines of the one log file."""
+        (name,) = os.listdir(self.folder)
+        with open(os.path.join(self.folder, name), encoding="utf-8", newline="") as f:
+            return [json.loads(line) for line in f]
+
+    def test_each_call_is_logged_with_what_it_added_to_the_prompt_and_its_raw_answer(self):
+        write("a.py", "old a\n")
+        answer = self.EDIT.format("a.py", "old a", "new a") + "CONTINUE"
+        self.run_main([answer, "done\r\n"], replies=["y"])
+        first, report, second = self.lines()
+        self.assertEqual(first, {"time": first["time"], "project": os.getcwd(), "model": "llama.cpp · demo", "call": 1,
+                                 "whole": True, "messages": self.prompts[0], "thinking": "", "answer": answer,
+                                 "cut": False})
+        time.strptime(first["time"], "%Y-%m-%dT%H:%M:%S")
+        self.assertEqual(report, {"report": ["applied a.py"]})
+        self.assertTrue(self.continues(2))  # so only the message it added is logged
+        self.assertEqual((second["call"], second["whole"], second["messages"], second["answer"]),
+                         (2, False, self.prompts[1][-1:], "done\r\n"))
+
+    def test_an_edit_that_failed_is_logged_as_the_model_is_told_of_it(self):
+        self.run_main(["FILE: a.py\n<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n", "DONE"])
+        self.assertEqual(self.lines()[1], {"report": [
+            "1 edit block(s) could not be read and were ignored: 1 with no ======= line between the old and the "
+            f"new lines. Write each change like this:\n{tolken.FORM}"]})
+
+    def test_images_are_logged_as_their_number(self):
+        write_bytes("shot.png", png_bytes())
+        model, session = FakeModel("eye"), tolken.Session(mock.Mock())
+        model.vision = True
+        session.use(model)
+        session.send("zzz what is in @shot.png")
+        (line,) = self.lines()
+        self.assertEqual([message.get("images") for message in line["messages"]], [None, 1])
+        self.assertEqual(len(model.seen[0][1]["images"]), 1)  # the model was sent the image itself
+
+    def test_the_newest_30_logs_are_kept(self):
+        for number in range(35):
+            write(os.path.join(self.folder, f"20200101-0000{number:02}-1.jsonl"), "")
+        write(os.path.join(self.folder, "notes.txt"), "")
+        self.run_main(["ok"])
+        names = sorted(os.listdir(self.folder))
+        self.assertEqual((len(names), names[0]), (31, "20200101-000006-1.jsonl"))  # 29 old ones, the new one, the notes
+
+    def test_nothing_is_logged_without_a_folder(self):
+        with mock.patch.object(tolken, "LOGS", None):
+            self.run_main(["ok"])
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_a_log_that_cannot_be_written_is_given_up_with_one_warning(self):
+        write("taken", "")  # a file where the folder should be
+        session = tolken.Session(mock.Mock())
+        with mock.patch.object(tolken, "LOGS", os.path.abspath("taken")):
+            session.keep(answer="one")
+            session.keep(answer="two")
+        self.assertEqual([call.args[1] for call in session.ui.note.call_args_list], ["warn"])
+
+
 class Settings(InTempDir):
     def setUp(self):
         super().setUp()
@@ -1956,6 +2051,14 @@ class Server(InTempDir):
         with mock.patch.object(tolken, "THINK", True):
             model.chat([{"role": "user", "content": "hi"}], mock.Mock(), think=False)
         self.assertIs(FakeServer.ollama_requests[-1]["think"], False)
+
+    def test_the_thinking_of_an_answer_is_kept_on_the_session(self):
+        for model, thinking in ((tolken.Ollama("small:1b", url=self.url), "let me think"),
+                                (tolken.Llama(8192, url=self.url), "thinking")):
+            model.thinks = True
+            session = tolken.Session(mock.Mock())
+            self.assertEqual(model.chat([{"role": "user", "content": "hi"}], mock.Mock(), session), "Hello")
+            self.assertEqual(session.thinking, thinking, model.label)
 
     def test_ollama_counts_learn_the_characters_per_token_from_its_calls(self):
         model, ui = tolken.Ollama("small:1b", url=self.url), mock.Mock()

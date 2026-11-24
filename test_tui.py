@@ -18,6 +18,7 @@ import tolken
 import tui
 
 tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
+tolken.LOGS = None  # the tests' calls are not logged
 
 
 def write(path, text):
