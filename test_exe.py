@@ -5,7 +5,7 @@ The full-screen interface is driven in a terminal of its own, which on Windows n
 (pip install pywinpty). .github/workflows/release.yml runs them on each build, before it is published.
 
 A fake llama-server stands in for the model. What is checked is what the build could break: that
-the settings and logs are kept next to the exe, that the full-screen interface starts (Textual, and
+the settings and sessions are kept next to the exe, that the full-screen interface starts (Textual, and
 Pygments for the code in an answer), that PDF and Word files are read (PyMuPDF), that git and a
 command run and see nothing of the exe's own run-time setup, and that a second tolken.exe started
 from a command runs.
@@ -206,8 +206,8 @@ class Exe(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.project, "settings.json")))
         self.plain("hello")  # and the ones beside it are read: they name the fake server
         self.assertEqual(len(Model.calls), 1)
-        self.assertEqual(len(glob.glob(os.path.join(self.bin, "logs", "*.jsonl"))), 1)  # the call's log is beside it too
-        self.assertFalse(os.path.exists(os.path.join(self.project, "logs")))
+        self.assertEqual(len(glob.glob(os.path.join(self.bin, "sessions", "*.jsonl"))), 1)  # the session is beside it too
+        self.assertFalse(os.path.exists(os.path.join(self.project, "sessions")))
 
     def test_pdf_and_word_files_are_read(self):
         import pymupdf

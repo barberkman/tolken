@@ -18,7 +18,7 @@ import tolken
 import tui
 
 tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
-tolken.LOGS = None  # the tests' calls are not logged
+tolken.SESSIONS = None  # the tests' sessions are not kept
 
 
 def write(path, text):
@@ -682,6 +682,44 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await press("down", "zzz look at @a.py")
             await press("down", "draft")
             await press("down", "draft")
+
+    async def test_resume_lists_the_sessions_and_shows_the_one_taken_up(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.answers = ["Hello there, friend.", "And again."]
+        with mock.patch.object(tolken, "SESSIONS", folder.name):
+            async with self.app.run_test() as pilot:
+                await self.submit(pilot, "/resume")
+                await pilot.pause()
+                self.assertEqual((self.items(), self.app.resumable), (["no earlier session in this folder"], None))
+                await self.submit(pilot, "zzz hello")
+                await self.until(pilot, lambda: not self.app.busy)
+                await self.submit(pilot, "/clear")
+                await pilot.pause()
+                await self.submit(pilot, "/resume")
+                await pilot.pause()
+                self.assertRegex(self.app.suggestions.content.plain, r"^› [\d-]+ [\d:]+ · 1 message · zzz hello$")
+                self.assertEqual(self.status().split(" │ ")[0], "choose a session")
+                self.assertTrue(self.status().endswith("│ ↑↓ choose · enter select · esc close"))
+                await pilot.press("escape")
+                self.assertFalse(self.app.suggestions.display)
+                self.assertEqual((self.app.resumable, self.status().split(" │ ")[0]), (None, "ready"))
+                await self.submit(pilot, "/resume")
+                await pilot.pause()
+                await self.type(pilot, "x")  # typing closes the list
+                self.assertEqual((self.app.resumable, self.app.suggestions.display), (None, False))
+                await self.submit(pilot, "/resume")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertEqual(self.items(), ["> zzz hello", "Hello there, friend.", "resumed · 1 message"])
+                self.assertEqual(self.app.session.history, [("zzz hello", "Hello there, friend.")])
+                self.assertEqual((self.app.resumable, self.app.suggestions.display, self.app.prompt.value),
+                                 (None, False, ""))
+                await self.submit(pilot, "zzz and now?")  # goes on from it, in the same file
+                await self.until(pilot, lambda: not self.app.busy)
+                self.assertEqual([asked for asked, _ in self.app.session.history], ["zzz hello", "zzz and now?"])
+                self.assertEqual(len(os.listdir(folder.name)), 1)
 
     async def test_model_list_switches_the_model(self):
         small = FakeModel("small")

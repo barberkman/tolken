@@ -4,4 +4,4 @@ settings.json
 *.patch
 build/
 dist/
-logs/
+sessions/

@@ -12,7 +12,7 @@ import bench
 import tolken
 
 tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
-tolken.LOGS = None  # the tests' calls are not logged
+tolken.SESSIONS = None  # the tests' sessions are not kept
 
 BLOCK = "FILE: {0}\n<<<<<<< SEARCH\n{1}\n=======\n{2}\n>>>>>>> REPLACE\n"
 FIB = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"

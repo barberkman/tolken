@@ -19,7 +19,7 @@ import bench
 import tolken
 
 tolken.apply_settings(bench.SETTINGS)  # the tests do not depend on the defaults tolken comes with
-tolken.LOGS = None  # the tests' calls are not logged
+tolken.SESSIONS = None  # the tests' sessions are not kept
 
 
 def write(path, text):
@@ -1666,7 +1666,7 @@ class Models(InTempDir):
 
 
 class Logs(InTempDir):
-    """The log of the model's calls, with the model replaced by canned answers."""
+    """The files the sessions are kept in and /resume reads, with the model replaced by canned answers."""
 
     EDIT, run_main, continues = Rounds.EDIT, Rounds.run_main, Rounds.continues
 
@@ -1675,21 +1675,37 @@ class Logs(InTempDir):
         folder = tempfile.TemporaryDirectory()  # not in the project folder, whose files are listed in the prompt
         self.addCleanup(folder.cleanup)
         self.folder = folder.name
-        patch = mock.patch.object(tolken, "LOGS", self.folder)
+        patch = mock.patch.object(tolken, "SESSIONS", self.folder)
         patch.start()
         self.addCleanup(patch.stop)
 
     def lines(self):
-        """The lines of the one log file."""
+        """The lines of the one session file."""
         (name,) = os.listdir(self.folder)
         with open(os.path.join(self.folder, name), encoding="utf-8", newline="") as f:
             return [json.loads(line) for line in f]
+
+    def session(self, name):
+        """A session whose model is a FakeModel of this name."""
+        session = tolken.Session(mock.Mock())
+        session.model = FakeModel(name)
+        return session
+
+    def kept(self, name, project, *messages, written=None):
+        """Write a session file as tolken keeps it: a call's line, then a line for each of messages. Returns its path."""
+        lines = [{"time": "2020-01-01T00:00:00", "project": project, "call": 1}]
+        lines += [{"message": message, "answer": "an answer", "ctx": [], "pins": [], "untold": []} for message in messages]
+        path = os.path.join(self.folder, name)
+        write(path, "".join(json.dumps(line) + "\n" for line in lines))
+        if written:
+            os.utime(path, (written, written))
+        return path
 
     def test_each_call_is_logged_with_what_it_added_to_the_prompt_and_its_raw_answer(self):
         write("a.py", "old a\n")
         answer = self.EDIT.format("a.py", "old a", "new a") + "CONTINUE"
         self.run_main([answer, "done\r\n"], replies=["y"])
-        first, report, second = self.lines()
+        first, report, second, message = self.lines()
         self.assertEqual(first, {"time": first["time"], "project": os.getcwd(), "model": "llama.cpp · demo", "call": 1,
                                  "whole": True, "messages": self.prompts[0], "thinking": "", "answer": answer,
                                  "cut": False})
@@ -1698,6 +1714,93 @@ class Logs(InTempDir):
         self.assertTrue(self.continues(2))  # so only the message it added is logged
         self.assertEqual((second["call"], second["whole"], second["messages"], second["answer"]),
                          (2, False, self.prompts[1][-1:], "done\r\n"))
+        self.assertEqual(message, {"message": "zzz question", "answer": "done\r\n", "ctx": [["a.py", 1, None]],
+                                   "pins": [["a.py", 1, None]], "untold": []})  # what /resume reads
+
+    def test_a_message_ends_with_its_line_only_if_it_got_an_answer(self):
+        write("a.py", "old a\n")
+        self.run_main([OSError("down")])
+        self.assertEqual(os.listdir(self.folder), [])
+        answer = self.EDIT.format("a.py", "old a", "new a") + "CONTINUE"
+        self.run_main([answer, OSError("down")], replies=["y"])  # the server fails after the first answer
+        self.assertEqual([(line.get("message"), line.get("answer")) for line in self.lines()[2:]],
+                         [("zzz question", answer)])
+
+    def test_resume_brings_back_the_messages_and_the_loaded_code_and_goes_on_in_the_same_file(self):
+        write("a.py", "needle = 1\n")
+        first = self.session("one")
+        first.send("zzz look at @a.py")
+        first.send("zzz and again")
+        (name,) = os.listdir(self.folder)
+        second = self.session("two")
+        second.send("zzz something else")  # forgotten when the other session is taken up
+        second.resume(os.path.join(self.folder, name))
+        self.assertEqual(first.history, [("zzz look at @a.py", "from one"), ("zzz and again", "from one")])
+        self.assertEqual((second.history, second.ctx, second.pins, second.untold, second.log),
+                         (first.history, [["a.py", 1, None]], [["a.py", 1, None]], [], []))
+        second.send("zzz go on")
+        prompt = "\n".join(message["content"] for message in second.model.seen[-1])  # built afresh
+        for part in ("needle = 1", "zzz look at @a.py", "zzz and again", "from one", "zzz go on"):
+            self.assertIn(part, prompt)
+        self.assertNotIn("zzz something else", prompt)
+        with open(os.path.join(self.folder, name), encoding="utf-8") as f:
+            lines = [json.loads(line) for line in f]
+        self.assertEqual([line["message"] for line in lines if "message" in line],
+                         ["zzz look at @a.py", "zzz and again", "zzz go on"])
+        self.assertEqual(len(os.listdir(self.folder)), 2)  # its own and the one it took up: none was begun
+
+    def test_resume_leaves_the_session_as_it_is_when_the_file_cannot_be_read(self):
+        session = self.session("one")
+        session.send("zzz hello")
+        with self.assertRaises(OSError):
+            session.resume(os.path.join(self.folder, "missing.jsonl"))
+        self.assertEqual(session.history, [("zzz hello", "from one")])
+
+    def test_sessions_are_listed_for_this_folder_with_the_last_written_to_first(self):
+        here = os.getcwd()
+        old = self.kept("b.jsonl", here, "zzz first   question\nof two lines", "zzz second", written=1_000_000_000)
+        new = self.kept("a.jsonl", here, "x" * 70, written=1_000_000_060)
+        self.kept("c.jsonl", os.path.dirname(here), "asked in another folder")
+        self.kept("d.jsonl", here)  # none of its messages got an answer
+        with open(self.kept("e.jsonl", here, "whole"), "a", encoding="utf-8") as f:
+            f.write('{"message": "cut off as it was writ')
+        write(os.path.join(self.folder, "notes.txt"), "not a session")
+        own = self.kept("f.jsonl", here, "the running one")
+        when = [time.strftime("%Y-%m-%d %H:%M", time.localtime(written)) for written in (1_000_000_060, 1_000_000_000)]
+        self.assertEqual(tolken.sessions(own), [(new, f"{when[0]} · 1 message · {'x' * 59}…"),
+                                                (old, f"{when[1]} · 2 messages · zzz first question of two lines")])
+        with mock.patch.object(tolken, "SESSIONS", None):
+            self.assertEqual(tolken.sessions(), [])
+        with mock.patch.object(tolken, "SESSIONS", os.path.join(self.folder, "none")):
+            self.assertEqual(tolken.sessions(), [])
+
+    def test_clear_begins_a_new_file(self):
+        session = self.session("one")
+        session.send("zzz one")
+        session.send("zzz two")
+        session.clear()
+        session.send("zzz three")
+        self.assertEqual(sorted(text.split(" · ", 1)[1] for _, text in tolken.sessions()),
+                         ["1 message · zzz three", "2 messages · zzz one"])
+
+    def test_the_plain_prompt_lists_the_sessions_and_takes_one_up(self):
+        session = self.session("one")
+        tolken.choose_session(session, "")
+        session.send("zzz first")
+        tolken.choose_session(session, "")  # the running session is not offered
+        self.assertEqual(self.printed.getvalue(), "[no earlier session in this folder]\n" * 2)
+        session.clear()
+        for wanted in ("", "7", "x", "1"):
+            tolken.choose_session(session, wanted)
+        self.assertRegex(self.printed.getvalue(), r"\n1\. [\d-]+ [\d:]+ · 1 message · zzz first\n"
+                         r"\[/resume NUMBER takes one up\]\n\[no session is numbered '7'\]\n"
+                         r"\[no session is numbered 'x'\]\n> zzz first\nfrom one\n\[resumed · 1 message\]\n$")
+        self.assertEqual(session.history, [("zzz first", "from one")])
+
+    def test_resume_is_a_command_of_the_plain_prompt(self):
+        calls = self.run_main(["the first answer", "the second answer"],
+                              inputs=["zzz first", "/clear", "/resume 1", "zzz second"])
+        self.assertIn("zzz first\n\nthe first answer", calls[1])
 
     def test_an_edit_that_failed_is_logged_as_the_model_is_told_of_it(self):
         self.run_main(["FILE: a.py\n<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n", "DONE"])
@@ -1711,7 +1814,7 @@ class Logs(InTempDir):
         model.vision = True
         session.use(model)
         session.send("zzz what is in @shot.png")
-        (line,) = self.lines()
+        line, _ = self.lines()
         self.assertEqual([message.get("images") for message in line["messages"]], [None, 1])
         self.assertEqual(len(model.seen[0][1]["images"]), 1)  # the model was sent the image itself
 
@@ -1723,15 +1826,22 @@ class Logs(InTempDir):
         names = sorted(os.listdir(self.folder))
         self.assertEqual((len(names), names[0]), (31, "20200101-000006-1.jsonl"))  # 29 old ones, the new one, the notes
 
+    def test_a_session_taken_up_again_is_not_deleted_for_its_old_name(self):
+        for number in range(31):
+            written = 2_000_000_000 if number == 0 else 1_000_000_000 + number  # the oldest by name was used last
+            self.kept(f"20200101-0000{number:02}-1.jsonl", os.getcwd(), "zzz", written=written)
+        self.run_main(["ok"])
+        self.assertEqual(sorted(os.listdir(self.folder))[:2], ["20200101-000000-1.jsonl", "20200101-000003-1.jsonl"])
+
     def test_nothing_is_logged_without_a_folder(self):
-        with mock.patch.object(tolken, "LOGS", None):
+        with mock.patch.object(tolken, "SESSIONS", None):
             self.run_main(["ok"])
         self.assertEqual(os.listdir(self.folder), [])
 
     def test_a_log_that_cannot_be_written_is_given_up_with_one_warning(self):
         write("taken", "")  # a file where the folder should be
         session = tolken.Session(mock.Mock())
-        with mock.patch.object(tolken, "LOGS", os.path.abspath("taken")):
+        with mock.patch.object(tolken, "SESSIONS", os.path.abspath("taken")):
             session.keep(answer="one")
             session.keep(answer="two")
         self.assertEqual([call.args[1] for call in session.ui.note.call_args_list], ["warn"])

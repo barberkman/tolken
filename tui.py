@@ -22,6 +22,8 @@ the model expects (asked in a short call of its own, which typing ends).
 Thinking, when it is on, is shown dim above the answer. The answer is shown as
 markdown (headings, lists, tables, highlighted code), each line break kept.
 /undo puts back the files that the last message to change files changed.
+/resume lists the earlier sessions of this folder, the last used first; Enter takes one
+up: its messages and answers are shown again, and the next message goes on from them.
 An edit is shown as a card; Enter applies it. A file the model wants to delete
 is shown the same way; Enter deletes it. So is a command it wants to run: Enter
 runs it; its output then follows as a card, and Esc stops a command that is
@@ -70,6 +72,7 @@ PLACEHOLDER = "Do you remember the Shire, Mr. Frodo? · @file pins code · / for
 COMMANDS = {  # what typing / offers, in this order
     "/model": "choose the model: llama-server's or one of Ollama's",
     "/settings": "view and change the settings",
+    "/resume": "take up an earlier session of this folder",
     "/undo": "put back the files that the last change of files changed",
     "/clear": "forget the loaded code and the conversation",
     "/exit": "quit",
@@ -579,6 +582,7 @@ class TolkenApp(App):
         self.models = None  # the models on offer while the /model list is open
         self.commands = None  # the command names on offer while the / list is open
         self.settings = None  # the names of the settings while the /settings list is open
+        self.resumable = None  # the files of the sessions on offer while the /resume list is open
         self.editing = None  # the setting whose value the input holds, until Enter saves it or Esc leaves it
         self.as_default = False  # the model list was opened from the settings: the model chosen is saved too
         self.suggestion = ""  # the next message offered in the empty input; Tab puts it there
@@ -754,7 +758,7 @@ class TolkenApp(App):
         context = f"{self.used or 0:,}/{size:,} ({(self.used or 0) * 100 // size}%)"
         asked = COMMENT_KEYS if self.prompt.value.strip() else self.prompt.placeholder
         keys = asked if self.asking else "please wait" if self.loading else "esc cancel" if self.busy \
-            else "↑↓ choose · enter select · esc close" if self.models is not None \
+            else "↑↓ choose · enter select · esc close" if self.models is not None or self.resumable is not None \
             else "↑↓ choose · enter run · tab complete · esc close" if self.commands is not None \
             else "↑↓ choose · enter edit · esc close" if self.settings is not None \
             else SETTING_KEYS if self.editing \
@@ -796,13 +800,14 @@ class TolkenApp(App):
     def on_text_area_changed(self, event):
         """Suggest commands for a / at the start, or project files for the @word that is being typed.
 
-        Typing also closes the model list and the settings list, and ends a call for a suggestion.
+        Typing also closes the model list, the settings list and the session list, and ends a call for a suggestion.
         """
         self.stop_suggesting()
-        if self.editing or self.settings is not None and not self.prompt.value:
-            return  # a setting's value is being typed; or /settings itself has just emptied the input
-        if self.models is not None or self.settings is not None:
-            self.models, self.settings, self.as_default, self.activity = None, None, False, "ready"
+        if self.editing or (self.settings is not None or self.resumable is not None) and not self.prompt.value:
+            return  # a setting's value is being typed; or /settings or /resume itself has just emptied the input
+        if self.models is not None or self.settings is not None or self.resumable is not None:
+            self.models, self.settings, self.resumable, self.as_default = None, None, None, False
+            self.activity = "ready"
         typed = self.prompt.value
         offered = [name for name in COMMANDS if name.startswith(typed)] if re.fullmatch(r"/\S*", typed) else []
         self.commands = offered or None
@@ -839,8 +844,8 @@ class TolkenApp(App):
 
     def close_list(self):
         self.files, self.models, self.commands, self.settings, self.matches = None, None, None, None, []
-        self.as_default = False
-        if self.activity in ("choose a model", "choose a setting"):
+        self.resumable, self.as_default = None, False
+        if self.activity in ("choose a model", "choose a setting", "choose a session"):
             self.activity = "ready"
         self.show_matches()
         self.tick()  # so the status bar changes at once, not at the next refresh
@@ -864,9 +869,9 @@ class TolkenApp(App):
             self.prompt.pastes = dict(pastes)
 
     def complete(self, enter=False):
-        """Enter or Tab on the open list: switch to the highlighted model, put the highlighted command
-        or the highlighted setting's value in the input, or put the highlighted file in place of the
-        @word before the cursor.
+        """Enter or Tab on the open list: switch to the highlighted model, take up the highlighted session,
+        put the highlighted command or the highlighted setting's value in the input, or put the highlighted
+        file in place of the @word before the cursor.
 
         Returns False when Enter should go on to send the input: no list is open, or a command was
         chosen with Enter, which runs it.
@@ -886,6 +891,11 @@ class TolkenApp(App):
             model, default = self.models[self.choice], self.as_default
             self.close_list()
             self.run_model(lambda: self.switch(model, default), f"loading {model.name}")
+            return True
+        if self.resumable is not None:
+            path = self.resumable[self.choice]
+            self.close_list()
+            self.resume(path)
             return True
         if self.settings is not None:
             name = self.settings[self.choice]
@@ -931,6 +941,8 @@ class TolkenApp(App):
                 self.run_model(lambda: self.find_model(wanted), "listing models")
             elif message == "/settings":
                 self.show_settings()
+            elif message == "/resume":
+                self.show_sessions()
             elif message:
                 self.offer("")
                 self.add("> " + typed, "user")
@@ -1036,6 +1048,36 @@ class TolkenApp(App):
         self.activity = "choose a model" if self.models is not None \
             else "choose a setting" if self.settings is not None else "ready"
         self.tick()
+
+    # ----- /resume -----
+
+    def show_sessions(self):
+        """Open the list of this folder's earlier sessions; Enter takes one up (see complete)."""
+        found = tolken.sessions(self.session.journal)
+        if not found:
+            self.add("no earlier session in this folder")
+            return
+        self.resumable, self.matches = [path for path, _ in found], [text for _, text in found]
+        self.choice, self.activity = 0, "choose a session"
+        self.show_matches()
+        self.tick()
+
+    def resume(self, path):
+        """Take up the session in the file at path, and show its messages and answers in place of the conversation."""
+        try:
+            self.session.resume(path)
+        except (OSError, ValueError) as error:
+            self.add(f"could not read the session: {error}", "bad")
+            return
+        self.conversation.remove_children()
+        self.answer, self.answer_text, self.shown, self.used = None, "", None, None
+        for asked, answered in self.session.history:
+            self.add("> " + asked, "user")
+            self.show_stream(None, answered, "answer")
+        count = len(self.session.history)
+        self.add(f"resumed · {count} message{'s' * (count != 1)}")
+        self.conversation.scroll_end(animate=False)
+        self.offer("")
 
     # ----- /settings -----
 

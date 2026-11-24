@@ -14,8 +14,9 @@ PATH, such as %USERPROFILE%\\.local\\bin, and run tolken from the project.
   @path:10-50    pin a line range
   /model         list the models (llama-server's and every Ollama server's); /model NAME switches
   /settings      list the settings and change one (full-screen interface)
+  /resume        list this folder's earlier sessions; /resume NUMBER takes one up
   /undo          put back the files that the last message to change files changed
-  /clear         forget the pinned code and the conversation
+  /clear         forget the pinned code and the conversation, and begin a new session
   /exit          exit
   \"\"\"            on a line by itself starts and ends a multi-line message (plain prompt)
 
@@ -84,12 +85,17 @@ its edits are made. It runs without a shell (shell syntax is refused, since a
 RUN_TIMEOUT seconds, and the start and end of its output go back to the model,
 which is then called again.
 
-Every call of the model is logged, to look into later what it was sent and what
-it answered: a file for each session in the logs folder next to this file (to
-tolken.exe), a JSON line for each call with the messages the call added to the
+Every session is kept in a file of its own in the sessions folder next to this
+file (to tolken.exe), to look into later what the model was sent and what it
+answered: a JSON line for each call with the messages the call added to the
 prompt, the model's thinking and its answer as it came, and a line with what
 the answer led to (the edits made, what could not be done, the commands'
-output). The newest KEEP_LOGS files are kept.
+output). Each message that got an answer ends with a line holding the message,
+its last answer and the code loaded then. /resume reads those lines to take up
+a session of the current folder: its messages and answers and its loaded code
+come back, the next call builds the prompt afresh, and the session goes on in
+the same file. /undo does not reach back into it. The KEEP_SESSIONS files last
+written to are kept.
 """
 import concurrent.futures
 import difflib
@@ -108,13 +114,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# The folder of this file, where the settings and the logs are kept. tolken.exe (see tolken.spec) is unpacked
-# to a new temporary folder at each start, so it keeps them next to itself.
+# The folder of this file, where the settings and the sessions are kept. tolken.exe (see tolken.spec) is
+# unpacked to a new temporary folder at each start, so it keeps them next to itself.
 HOME = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 SETTINGS = os.path.join(HOME, "settings.json")
-# The folder the model's calls are logged in, a file for each session (see Session.keep); None for no log.
-LOGS = os.path.join(HOME, "logs")
-KEEP_LOGS = 30          # the newest log files kept; older ones are deleted when a new one is begun
+# The folder the sessions are kept in, a file for each (see Session.keep); None to keep none.
+SESSIONS = os.path.join(HOME, "sessions")
+KEEP_SESSIONS = 30      # the session files last written to that are kept; the others are deleted when one is begun
+BEGUN = itertools.count(1)  # numbers the session files this process begins, so that no two share a name
 # The defaults of the settings; load_settings() replaces them with those of the file, and writes them
 # to the file when there is none.
 SERVERS = ["http://169.254.51.51:11434", "http://127.0.0.1:8080"]  # an Ollama server's and llama-server's
@@ -1401,6 +1408,37 @@ def clip(text, budget):
 
 # ---------- the conversation ----------
 
+def session_lines(path):
+    """(the folder a session was held in, the lines that end its messages) of the session file at path."""
+    with open(path, encoding="utf-8") as f:
+        project = json.loads(f.readline())["project"]
+        return project, [json.loads(line) for line in f if line.startswith('{"message"')]  # not the calls' long lines
+
+
+def sessions(skip=None):
+    """The sessions of the current folder that /resume can take up, as (path, label), the last written to first.
+
+    Left out: the file at skip (the running session's own), a session none of whose messages got an
+    answer, and a file that cannot be read.
+    """
+    found = []
+    for name in os.listdir(SESSIONS) if SESSIONS and os.path.isdir(SESSIONS) else ():
+        path = os.path.join(SESSIONS, name)
+        if not name.endswith(".jsonl") or path == skip:
+            continue
+        try:
+            project, lines = session_lines(path)
+            written = os.path.getmtime(path)
+        except (OSError, ValueError, KeyError, TypeError):  # not a session's file, or its last line was cut off
+            continue
+        if lines and os.path.normcase(project) == os.path.normcase(os.getcwd()):
+            first = " ".join(lines[0]["message"].split())
+            found.append((written, path, f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(written))} · "
+                          f"{len(lines)} message{'s' * (len(lines) != 1)} · "
+                          f"{first if len(first) <= 60 else first[:59] + '…'}"))
+    return [(path, text) for _, path, text in sorted(found, reverse=True)]
+
+
 class Session:
     """The conversation state and the per-message loop, independent of how it is shown."""
 
@@ -1413,7 +1451,7 @@ class Session:
         self.cut = self.thought = False  # whether the last answer hit max_out, and whether the model thought
         self.overthought = False  # whether the last answer's thinking reached think_max
         self.thinking = ""  # the last answer's thinking, which stream() leaves here
-        self.journal = None  # this session's file in LOGS, named at its first call; False once it could not be written
+        self.journal = None  # this session's file in SESSIONS, named at its first call; False once it could not be written
         self.untracked = True  # whether git listed the untracked files at the last message; see git_files()
         self.clear()
 
@@ -1451,25 +1489,32 @@ class Session:
             self.log = []  # the system prompt has changed: the next call builds the prompt afresh
 
     def keep(self, **record):
-        """Add one line to this session's log file. The first line begins the file, and the oldest files beyond
-        KEEP_LOGS are deleted then. A log that cannot be written is given up, so that it never ends a message."""
-        if not LOGS or self.journal is False:
+        """Add one line to this session's file. The first line begins the file, and the files beyond the
+        KEEP_SESSIONS last written to are deleted then. A file that cannot be written is given up, so that it
+        never ends a message."""
+        if not SESSIONS or self.journal is False:
             return
         try:
             if not self.journal:
-                os.makedirs(LOGS, exist_ok=True)
-                for old in sorted(name for name in os.listdir(LOGS) if name.endswith(".jsonl"))[:1 - KEEP_LOGS]:
-                    os.remove(os.path.join(LOGS, old))
-                self.journal = os.path.join(LOGS, f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.jsonl")
+                os.makedirs(SESSIONS, exist_ok=True)
+                names = [name for name in os.listdir(SESSIONS) if name.endswith(".jsonl")]
+                # By when they were last written to, as a session taken up again goes on in its old file.
+                names.sort(key=lambda name: (os.path.getmtime(os.path.join(SESSIONS, name)), name))
+                for old in names[:1 - KEEP_SESSIONS]:
+                    os.remove(os.path.join(SESSIONS, old))
+                self.journal = os.path.join(
+                    SESSIONS, f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{next(BEGUN)}.jsonl")
             # Letters as they are; half a surrogate pair, which UTF-8 cannot hold, as the escape JSON has for it.
             with open(self.journal, "a", encoding="utf-8", errors="backslashreplace", newline="") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as error:
             self.journal = False
-            self.ui.note(f"could not write the log in {LOGS}: {error.strerror or error}", "warn")
+            self.ui.note(f"could not write the session in {SESSIONS}: {error.strerror or error}", "warn")
 
     def clear(self):
-        """Forget the loaded code and the conversation."""
+        """Forget the loaded code and the conversation; the next message begins a new session file."""
+        if self.journal:
+            self.journal = None
         self.ctx, self.pins = [], []  # ctx: code kept between messages; pins: the part asked for by name
         self.history = []  # (message, answer) of each message so far; during a message, the last is its own
         # The prompt of the last call and its answer, which the next call continues while it fits, so that
@@ -1586,6 +1631,28 @@ class Session:
                 pass
 
     def send(self, question):
+        """Answer one message (see reply()) and, if it got an answer, end it in the session's file with the
+        line that /resume reads: the message, its last answer and the code loaded now."""
+        known = len(self.history)
+        try:
+            self.reply(question)
+        finally:  # however the message ended: done, cancelled, or a server error after an earlier answer
+            if len(self.history) > known:
+                self.keep(message=question, answer=self.history[-1][1], ctx=self.ctx, pins=self.pins,
+                          untold=self.untold)
+
+    def resume(self, path):
+        """Take up the session kept in the file at path, which goes on in that file: its messages and answers,
+        and the code it had loaded. The next call builds the prompt afresh, as after a switch of model.
+        Raises OSError or ValueError when the file cannot be read."""
+        _, lines = session_lines(path)
+        self.clear()
+        self.history = [(line["message"], line["answer"]) for line in lines]
+        if lines:
+            self.ctx, self.pins, self.untold = lines[-1]["ctx"], lines[-1]["pins"], lines[-1]["untold"]
+        self.journal = path
+
+    def reply(self, question):
         """Answer one message: build the prompt, call the model, load the files it asks for, apply its edits.
 
         The model is called again while it asks for files that are not shown, made
@@ -2089,6 +2156,26 @@ def choose_model(session, wanted):
         print(f"[no single model matches {wanted!r}]")
 
 
+def choose_session(session, wanted):
+    """The plain prompt's /resume: list the current folder's earlier sessions, or take up the one a number refers to."""
+    found = sessions(session.journal)
+    if not wanted:
+        for number, (_, text) in enumerate(found, 1):
+            print(f"{number}. {text}")
+        print("[/resume NUMBER takes one up]" if found else "[no earlier session in this folder]")
+    elif wanted.isdigit() and 0 < int(wanted) <= len(found):
+        try:
+            session.resume(found[int(wanted) - 1][0])
+        except (OSError, ValueError) as error:
+            print(f"[could not read the session: {error}]")
+            return
+        for asked, answered in session.history:
+            print(f"> {asked}\n{answered}")
+        print(f"[resumed · {len(session.history)} message{'s' * (len(session.history) != 1)}]")
+    else:
+        print(f"[no session is numbered {wanted!r}]")
+
+
 def main():
     sys.stdout.reconfigure(errors="replace")
     session = Session(PLAIN)
@@ -2096,7 +2183,7 @@ def main():
     if start:
         choose_model(session, start)
     print(f"{session.model.url} | {session.size} tokens | approve: {session.approve} | "
-          "@file or @file:10-50 pins code, /model, /undo, /clear, /exit")
+          "@file or @file:10-50 pins code, /model, /resume, /undo, /clear, /exit")
     while True:
         try:
             question = read_message()
@@ -2112,6 +2199,8 @@ def main():
                 print(f"[{note}]")
         elif question.split()[:1] == ["/model"]:
             choose_model(session, question[6:].strip())
+        elif question.split()[:1] == ["/resume"]:
+            choose_session(session, question[7:].strip())
         elif question:
             try:
                 session.send(question)
