@@ -6,7 +6,11 @@ one for each time the model asks for more files or, after its edits, goes on.
 In a terminal with Textual installed it opens the full-screen interface (tui.py);
 otherwise, or with --plain, it is a plain prompt.
 
-  @path          pin a whole file
+On Windows it is also tolken.exe, from the releases on GitHub: all of it in one
+file that needs nothing installed (tolken.spec builds it). Put it in a folder on
+PATH, such as %USERPROFILE%\\.local\\bin, and run tolken from the project.
+
+  @path         pin a whole file
   @path:10-50    pin a line range
   /model         list the models (llama-server's and every Ollama server's); /model NAME switches
   /settings      list the settings and change one (full-screen interface)
@@ -15,9 +19,10 @@ otherwise, or with --plain, it is a plain prompt.
   /exit          exit
   \"\"\"            on a line by itself starts and ends a multi-line message (plain prompt)
 
-Settings are read at startup from settings.json next to this file, which is
-written with the defaults when it is missing; /settings changes one, there and
-for the session that is running. Keys left out keep their defaults:
+Settings are read at startup from settings.json next to this file (to
+tolken.exe), which is written with the defaults when it is missing; /settings
+changes one, there and for the session that is running. Keys left out keep
+their defaults:
   servers         llama-server and Ollama URLs, on this computer or another one on the
                   network (there, set OLLAMA_HOST=0.0.0.0:11434 and open port 11434);
                   each server is asked which of the two it is
@@ -96,7 +101,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+# tolken.exe (see tolken.spec) is unpacked to a new temporary folder at each start, so it keeps them next to itself.
+SETTINGS = os.path.join(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)),
+                        "settings.json")
 # The defaults of the settings; load_settings() replaces them with those of the file, and writes them
 # to the file when there is none.
 SERVERS = ["http://169.254.51.51:11434", "http://127.0.0.1:8080"]  # an Ollama server's and llama-server's
@@ -1288,6 +1295,27 @@ def listed(command):
     return any(entry.split() and words[:len(entry.split())] == entry.split() for entry in RUN)
 
 
+def isolate_commands():
+    """In tolken.exe, keep what PyInstaller's start set up for tolken itself from reaching the commands it runs.
+
+    The exe is unpacked to a temporary folder, from which Windows is told to load DLLs first
+    (SetDllDirectory); a command, and git, would inherit that, and could load tolken's copy of a DLL
+    in place of its own. tolken's own modules, which load theirs as they are imported (PyMuPDF once
+    a PDF is shown), still find them in the folder through AddDllDirectory, which is not inherited.
+    The _PYI_ variables go too, so that a tolken.exe a command starts unpacks itself rather than
+    using this one's folder, which is deleted when this one ends.
+    """
+    global DLL_FOLDER
+    if not getattr(sys, "frozen", False):
+        return
+    for name in [name for name in os.environ if name.startswith("_PYI_")]:
+        del os.environ[name]
+    if os.name == "nt":
+        import ctypes
+        DLL_FOLDER = os.add_dll_directory(sys._MEIPASS)  # kept: closing it would take the folder away
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+
+
 def kill_tree(process):
     """End a command and the processes it started, which would otherwise hold its output open."""
     try:
@@ -2032,6 +2060,7 @@ def main():
 
 if __name__ == "__main__":
     import tolken  # this file again, as the module tui.py imports, so that both see the settings loaded here
+    tolken.isolate_commands()
     tolken.load_settings()
     if "--plain" in sys.argv or not (sys.stdin.isatty() and sys.stdout.isatty()):
         tolken.main()
