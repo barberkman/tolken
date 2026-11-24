@@ -19,7 +19,10 @@ After an answer the empty input offers a next message, dim, and Tab puts it in t
 input to send or change: "continue", "try again" or "commit the changes" when how
 the message ended makes that plain; else, with the suggest setting at "model", what
 the model expects (asked in a short call of its own, which typing ends).
-Thinking, when it is on, is shown dim above the answer. The answer is shown as
+Thinking, when it is on, is shown dim above the answer. Where a sentence of it starts
+with a word of doubt ("Wait", "Actually", "Hmm"…) the word is green, and the empty input
+answers with a line from Middle-earth until the thinking ends; a word of finding ("Aha",
+"Got it"…) is gold. The answer is shown as
 markdown (headings, lists, tables, highlighted code), each line break kept.
 /undo puts back the files that the last message to change files changed.
 /resume lists the earlier sessions of this folder, the last used first; Enter takes one
@@ -102,6 +105,18 @@ PHRASES = (  # shown above the input while the model works, in shuffled order, a
 )
 RING = "◯O∣O"  # a ring turning on its axis: face on, tilted, edge on, tilted; shown before the phrase
 RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛜᛞᛟ"  # the Elder Futhark; a few flicker after the phrase while the model thinks
+SENTENCE = r"(?:^[ \t]*(?:[-*•] )?|(?<=[.!?…:] ))"  # where a sentence starts: on a new line (after a bullet), or after another
+DOUBTS = re.compile(  # the words the model takes its thinking back with, shown green (see marked)
+    SENTENCE + r"((?:Wait|But wait|Oh,? wait|Actually|Hold on|Nope|Oops|Scratch that|Never mind|On second thought"
+    r"|Let me (?:reconsider|re-read|double-check)|Hm+|Not sure|Or is it)\b|No[,.]|Is that right\?)", re.MULTILINE)
+FOUND = re.compile(  # the words it finds something with, shown gold
+    SENTENCE + r"((?:Aha|I see|Got it|Of course)\b|[OA]h[,!](?! wait))", re.MULTILINE)
+HECKLES = (  # shown in the empty input when the thinking has a new word of doubt, until it ends
+    "Fool of a Took!", "I have no memory of this place…", "That is not the way to Mordor, Mr. Frodo.",
+    "Sneaky little thoughtses, precious.", "Not all those who wander are lost. This one might be.",
+    "Even the very wise cannot see all ends.", "One does not simply get it right the first time.",
+    "We've had one thought, yes. What about second thoughts?",
+)
 
 
 def shift_held():
@@ -374,6 +389,18 @@ def displayed(text):
     return "\n".join(out + lines[-1:])
 
 
+def marked(text):
+    """The thinking as shown, and how many words of doubt it has: where a sentence starts with one
+    ("Wait", "Actually"…) the word is green; with a word of finding ("Aha", "Got it"…), gold."""
+    shown = Text(text)
+    for match in FOUND.finditer(text):
+        shown.stylize("bold #e5c07b", *match.span(1))
+    doubts = [match.span(1) for match in DOUBTS.finditer(text)]
+    for span in doubts:
+        shown.stylize("bold #98c379", *span)
+    return shown, len(doubts)
+
+
 def parser():
     """The markdown parser for answers: without HTML, so that text such as Optional<User> is shown and
     not taken for a tag, and keeping each line break, as models often write plain lines that markdown
@@ -591,6 +618,7 @@ class TolkenApp(App):
         self.pieces, self.thoughts = collections.deque(), collections.deque()  # streamed answer and thinking not yet on screen
         self.answer, self.answer_text = None, ""  # the widget of the answer being streamed, and its text
         self.thought, self.thought_text = None, ""  # the same for the thinking before it
+        self.doubts, self.heckle = 0, ""  # the words of doubt in that thinking, and the line the input answers them with
         self.shown, self.shown_text = None, ""  # the same for the last answer that finished
         self.busy = False  # a message is being answered
         # The Event of a change waiting for Enter / Esc, and the answer given: True, False or what to do instead.
@@ -662,7 +690,9 @@ class TolkenApp(App):
         if self.answer is not None:
             self.shown, self.shown_text = self.answer, self.answer_text
         self.answer, self.answer_text = None, ""
-        self.thought, self.thought_text = None, ""
+        self.thought, self.thought_text, self.doubts = None, "", 0
+        if self.heckle:
+            self.set_heckle("")
 
     def add(self, content, kind="info"):
         """Append one item (a message, note or edit card) to the conversation and return its widget."""
@@ -696,6 +726,8 @@ class TolkenApp(App):
                 self.generated += 1
             if self.answer_text.strip():
                 self.answer = self.show_stream(self.answer, self.answer_text, "answer")
+                if self.heckle:  # the thinking is over
+                    self.set_heckle("")
                 if self.activity in ("waiting for model", "thinking"):
                     self.activity = "answering"
         if follow:
@@ -704,7 +736,8 @@ class TolkenApp(App):
     def show_stream(self, widget, text, kind):
         """Show streamed text in widget, or in a new one of class kind when widget is None; return the widget.
 
-        The answer is shown as markdown, the thinking as plain text.
+        The answer is shown as markdown, the thinking as plain text with its words of doubt and finding
+        coloured (see marked); a new word of doubt is answered in the empty input.
         """
         if widget is None:
             widget = Answer() if kind == "answer" else Static(classes=kind, markup=False)
@@ -712,7 +745,11 @@ class TolkenApp(App):
         if kind == "answer":
             widget.show(displayed(text.lstrip()))
         else:
-            widget.update(text.strip())
+            shown, doubts = marked(text.strip())
+            widget.update(shown)
+            if doubts > self.doubts:
+                self.doubts = doubts
+                self.set_heckle(random.choice([line for line in HECKLES if line != self.heckle]))
         return widget
 
     # ----- the status bar -----
@@ -978,7 +1015,13 @@ class TolkenApp(App):
             self.show_placeholder()
 
     def show_placeholder(self):
-        self.prompt.placeholder = f"{self.suggestion} · tab to use" if self.suggestion else PLACEHOLDER
+        self.prompt.placeholder = f"{self.suggestion} · tab to use" if self.suggestion else self.heckle or PLACEHOLDER
+
+    def set_heckle(self, line):
+        """Show line in the empty input in place of the placeholder; "" puts the placeholder back."""
+        self.heckle = line
+        if not (self.asking or self.editing):  # the input shows their keys (see offer)
+            self.show_placeholder()
 
     def suggested(self, call, text):
         """The model's suggestion has come; it is offered unless that call was ended meanwhile."""

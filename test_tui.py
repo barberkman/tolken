@@ -217,6 +217,21 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         answer = "First:\n" + self.BLOCK.format("a.py", "x", "y") + more + "Done."
         self.assertEqual(tui.without_blocks(answer, "a.py"), "First:\n\nDone.")
 
+    def test_marked_colours_the_words_a_sentence_of_thinking_starts_with(self):
+        def words(text):
+            shown, doubts = tui.marked(text)
+            self.assertEqual(shown.plain, text)
+            return [(text[span.start:span.end], str(span.style)) for span in sorted(shown.spans)], doubts
+
+        green, gold = "bold #98c379", "bold #e5c07b"
+        self.assertEqual(words("Wait, that is wrong. Actually it is 4.\n- Hmm, or 5? No. Wait."),
+                         ([("Wait", green), ("Actually", green), ("Hmm", green), ("No.", green), ("Wait", green)], 5))
+        self.assertEqual(words("Aha, the loop.\n  Oh, I see. Got it."), ([("Aha", gold), ("Oh,", gold), ("Got it", gold)], 0))
+        self.assertEqual(words("Oh, wait. Let me re-read it: Of course!"),
+                         ([("Oh, wait", green), ("Let me re-read", green), ("Of course", gold)], 2))
+        for plain in ("It is actually fine, so wait for it.", "No changes needed.", "Right side. Waiting. I seem fine."):
+            self.assertEqual(words(plain), ([], 0))
+
     async def run_edit(self, key):
         write("a.txt", "one\ntwo\n")
         self.answers = ["Change it:\n\n```\n" + self.BLOCK.format("a.txt", "two", "2") + "```\n", "DONE"]
@@ -983,6 +998,53 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
                 self.assertRegex(str(flavor.content), r"^[◯O∣] [^ᚠ-ᛟ]+$")  # the runes are gone with the answer
                 answered.set()
                 await self.until(pilot, lambda: not self.app.busy)
+
+    async def test_a_word_of_doubt_in_the_thinking_is_heckled_in_the_empty_input(self):
+        steps = [threading.Event() for _ in range(4)]
+
+        def chat(messages, url, ui, session, size=None, think=None):
+            for thought, step in zip(("Aha, I see.", " Wait, no.", " Actually, it is 4."), steps):
+                ui.thinking(thought)
+                step.wait(5)
+            ui.text("The answer.")
+            steps[3].wait(5)
+            ui.text("\n")
+            return "The answer."
+
+        with mock.patch.object(tolken, "chat", chat):
+            async with self.app.run_test() as pilot:
+                prompt = self.app.prompt
+                await self.submit(pilot, "zzz hi")
+                await self.until(pilot, lambda: self.app.activity == "thinking")
+                self.assertEqual(prompt.placeholder, tui.PLACEHOLDER)  # a word of finding is not heckled
+                steps[0].set()
+                await self.until(pilot, lambda: prompt.placeholder != tui.PLACEHOLDER)
+                first = prompt.placeholder
+                self.assertIn(first, tui.HECKLES)
+                steps[1].set()
+                await self.until(pilot, lambda: prompt.placeholder != first)
+                self.assertIn(prompt.placeholder, tui.HECKLES)
+                steps[2].set()
+                await self.until(pilot, lambda: self.app.activity == "answering")
+                self.assertEqual(prompt.placeholder, tui.PLACEHOLDER)  # the thinking is over
+                steps[3].set()
+                await self.until(pilot, lambda: not self.app.busy)
+
+    async def test_the_heckle_goes_when_the_thinking_is_cancelled(self):
+        def chat(messages, url, ui, session, size=None, think=None):
+            ui.thinking("Wait, no.")
+            while not session.stopped:
+                time.sleep(0.01)
+            return ""
+
+        with mock.patch.object(tolken, "chat", chat):
+            async with self.app.run_test() as pilot:
+                await self.submit(pilot, "zzz hi")
+                await self.until(pilot, lambda: self.app.prompt.placeholder in tui.HECKLES)
+                await pilot.press("escape")
+                await self.until(pilot, lambda: not self.app.busy)
+                self.assertNotIn(self.app.prompt.placeholder, tui.HECKLES)
+                self.assertEqual((self.app.heckle, self.app.doubts), ("", 0))
 
     async def test_model_by_name_unknown_name_and_failed_load(self):
         small, broken = FakeModel("small"), FakeModel("broken", fail=True)
