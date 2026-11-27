@@ -14,6 +14,8 @@ PATH, such as %USERPROFILE%\\.local\\bin, and run tolken from the project.
   @path:10-50    pin a line range
   /model         list the models (llama-server's and every Ollama server's); /model NAME switches
   /settings      list the settings and change one (full-screen interface)
+  /think         say how much the model thinks; /think off, on, low, medium or high sets
+                 it from the next call on, until tolken exits (settings.json keeps its own)
   /resume        list this folder's earlier sessions; /resume NUMBER takes one up
   /undo          put back the files that the last message to change files changed
   /clear         forget the pinned code and the conversation, and begin a new session
@@ -212,9 +214,12 @@ GO_ON = ("Continue the task. The latest copy of each file above, with the change
 # The path line is left out when a block follows another one for the same file. A block's text never runs
 # past the next <<<<<<< SEARCH line, so a block left open is dropped, not run into the next one. Small
 # models often end a block with a second ======= line; it is taken for the end when no >>>>>>> REPLACE
-# comes before the next block or the end of the answer.
+# comes before the next block or the end of the answer. They also end the old lines with a
+# >>>>>>> REPLACE line before the =======; that line is dropped. A block that has several ======= lines
+# and its end marker is divided at the first one here; reading() looks at the file to see which one divides it.
 BLOCK = re.compile(
-    r"^(?:([^\n]+)\n+)?(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n((?:(?!^<{5,9} SEARCH).)*?)^={5,9}[ \t]*\n"
+    r"^(?:([^\n]+)\n+)?(?:```[^\n]*\n)?<{5,9} SEARCH[ \t]*\n((?:(?!^<{5,9} SEARCH).)*?)"
+    r"(?:^>{5,9} REPLACE[ \t]*\n)?^={5,9}[ \t]*\n"
     r"((?:(?!^<{5,9} SEARCH).)*?)"
     r"(?:^>{5,9} REPLACE|^={5,9}[ \t]*$(?=(?:(?!^<{5,9} SEARCH|^>{5,9} REPLACE).)*(?:\Z|^<{5,9} SEARCH)))",
     re.S | re.M)
@@ -1060,16 +1065,32 @@ def requested(answer, files=None):
     file name matches anywhere in the project. files are the project's readable files,
     when they have been listed already.
     """
-    names = " ".join(re.findall(r"^NEED:(.*)$", answer, re.M)).split()
+    names = asked(answer)
     project, entries = ((readable_files() if files is None else files) if names else []), []
     for name in names:
-        name, start, end = split_range(name.strip("`'\","))
+        name, start, end = split_range(name)
         name = local(norm(name)).lower()
         for path in project:
             if ("/" + path.lower()).endswith("/" + name) or path.lower().startswith(name + "/"):
                 if [path, start, end] not in entries:
                     entries.append([path, start, end])
     return entries
+
+
+def asked(answer):
+    """The names on the NEED: lines of an answer, without the marks around them."""
+    names = " ".join(re.findall(r"^NEED:(.*)$", answer, re.M)).split()
+    return [name.strip("`'\",") for name in names if name.strip("`'\",")]
+
+
+def unmet(answer, files, shown):
+    """What to tell a model whose NEED: lines brought no file: which files it has already (they are in
+    shown, the context entries), and which names stand for no file of the project's files."""
+    have = [label(entry) for entry in requested(answer, files) if entry in shown]
+    none = [name for name in asked(answer) if not requested(f"NEED: {name}", files)]
+    return ([f"not sent again, because the latest copy above (with the changed parts shown after it) is as "
+             f"the file is now: {', '.join(have)}"] * bool(have)
+            + [f"there is no file to show for: {', '.join(none)}"] * bool(none))
 
 
 def local(path):
@@ -1182,6 +1203,26 @@ def apply_edit(text, old, new):
     return text.replace(old, new) if text.count(old) == 1 else None
 
 
+def reading(text, old, new):
+    """(old, new) as a block for text is meant, when its new lines hold ======= lines: any may be the divider.
+
+    parse_edits() takes the first ======= line for the divider. The last one whose old lines (with the
+    ======= lines before it) match one place of text is the divider instead: those lines are the file's.
+    Otherwise new lines that say the same on both sides of a ======= line are the model repeating itself,
+    and are taken once.
+    """
+    lines = new.split("\n")
+    marks = [i for i, line in enumerate(lines) if re.fullmatch(r"={5,9}[ \t]*", line)]
+    for i in reversed(marks):
+        longer, rest = "\n".join([old, "=======", *lines[:i]]), "\n".join(lines[i + 1:])
+        if apply_edit(text, longer, rest) is not None:
+            return longer, rest
+    for i in marks:
+        if lines[:i] == lines[i + 1:] and "".join(lines[:i]).strip():
+            return old, "\n".join(lines[:i])
+    return old, new
+
+
 def edit_problem(text, old):
     """Why apply_edit cannot replace old in text: it matches several places, or none (then the nearest lines)."""
     lines, old_lines = text.split("\n"), old.split("\n")
@@ -1242,6 +1283,7 @@ def edit_file(path, blocks, ui=PLAIN, auto=False):
     old = new = raw.replace("\r\n", "\n")
     for search_text, replace in blocks:
         if exists and search_text:
+            search_text, replace = reading(new, search_text, replace)
             result = apply_edit(new, search_text, replace)
             if result is None:
                 problem(f"could not apply an edit to {path}: {edit_problem(new, search_text)}")
@@ -1655,7 +1697,8 @@ class Session:
     def reply(self, question):
         """Answer one message: build the prompt, call the model, load the files it asks for, apply its edits.
 
-        The model is called again while it asks for files that are not shown, made
+        The model is called again while it asks for files that are not shown, asks
+        for none that can be sent (it is told why, see unmet()), made
         changes without ending with DONE, ends with CONTINUE, an edit could not be
         applied, its answer was cut off, or the user said what to do instead of a
         change or command. It stops when the user just says no to one, the window
@@ -1688,9 +1731,13 @@ class Session:
         if len(news) > listing:  # so much has changed that the list is sent again, in a prompt built afresh
             self.log, news = [], ""
         self.listed = set(files) if news else self.listed
+        def after(notes):
+            """The question, after what the model has not seen of how its last answer went."""
+            return "What happened after your last answer:\n" + "\n".join(notes) + "\n\n" + question
+
         prompt = question  # what the next call asks: the question, or how the model's edits went
         if self.untold:  # an edit declined, a failed edit or a command's output the model has not seen
-            prompt = "What happened after your last answer:\n" + "\n".join(self.untold) + "\n\n" + question
+            prompt = after(self.untold)
         mine = False  # whether the last exchange of the history is this message's
 
         def kept():
@@ -1800,11 +1847,18 @@ class Session:
             if changed:
                 files = readable_files()  # with the files it created or deleted
             wanted = self.visible([entry for entry in requested(said, files) if entry not in self.ctx])
+            why = [] if wanted else unmet(said, files, self.ctx)  # why the files it asked for are not coming
+            if why:  # told in the next call, or with the next message when this was the last call
+                for text in why:
+                    ui.note(text, "warn")
+                self.keep(report=why)
+                report += why
+                self.untold = report
             more = CONTINUE.search(said) or bool(changed) and not DONE.search(said)
             idle = 0 if changed or wanted or comment else idle + 1
             crowded = full or shown != before  # the window is full: going on is worth it only while files change
             if call == MAX_CALLS or not comment and (declined or crowded and not changed or idle == 2
-                                                     or not (wanted or more or problems or ran)):
+                                                     or not (wanted or more or problems or ran or why)):
                 break  # the user stepped in, nothing is happening, it has gone on long enough, or the model is done
             if changed or problems or more or ran or comment:
                 # Tell the model how its edits and commands went, and show it the files it changed or tried to.
@@ -1817,6 +1871,8 @@ class Session:
                 named = dict.fromkeys([*changed, *(path for path, _, _ in parse_edits(answer) if path)])
                 wanted += [[path, 1, None] for path in named if os.path.isfile(path)
                            and not any(entry[0] == path for entry in self.ctx + wanted)]
+            elif why:
+                prompt = after(why)
             if wanted and chars(self.ctx) + chars(wanted) > budget:
                 # No room for all of it: cut the requested files to fit and drop older code. From now on
                 # an answer that changes nothing ends the message.
@@ -2090,6 +2146,20 @@ def save_setting(name, value):
     apply_settings({**current_settings(), name: value})
 
 
+THINKS = {"off": False, "on": True, "low": "low", "medium": "medium", "high": "high"}  # what /think takes
+
+
+def set_think(wanted):
+    """/think: set the think setting from the next call on, until tolken exits (settings.json keeps
+    its own), and return what to tell the user. Without wanted, only what the setting is."""
+    global THINK
+    if wanted and wanted not in THINKS:
+        return f"/think takes one of: {', '.join(THINKS)}"
+    if wanted:
+        THINK = THINKS[wanted]
+    return f"thinking: {THINK if isinstance(THINK, str) else 'on' if THINK else 'off'}"
+
+
 def load_settings(path=SETTINGS):
     """Replace the default settings with those of the file, which is written with the defaults if missing.
 
@@ -2183,7 +2253,7 @@ def main():
     if start:
         choose_model(session, start)
     print(f"{session.model.url} | {session.size} tokens | approve: {session.approve} | "
-          "@file or @file:10-50 pins code, /model, /resume, /undo, /clear, /exit")
+          "@file or @file:10-50 pins code, /model, /think, /resume, /undo, /clear, /exit")
     while True:
         try:
             question = read_message()
@@ -2201,6 +2271,8 @@ def main():
             choose_model(session, question[6:].strip())
         elif question.split()[:1] == ["/resume"]:
             choose_session(session, question[7:].strip())
+        elif question.split()[:1] == ["/think"]:
+            print(f"[{set_think(question[6:].strip())}]")
         elif question:
             try:
                 session.send(question)

@@ -828,6 +828,17 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
             await self.type(pilot, "x")  # typing closes the list, as it closes the model list
             self.assertEqual((self.app.settings, self.app.suggestions.display), (None, False))
 
+    async def test_think_sets_the_thinking_for_the_calls_that_follow(self):
+        self.keep_settings()
+        tolken.THINK = False
+        async with self.app.run_test() as pilot:
+            for typed, said in (("/think", "thinking: off"), ("/think high", "thinking: high"),
+                                ("/think lots", "/think takes one of: off, on, low, medium, high")):
+                await self.submit(pilot, typed)
+                await pilot.pause()
+                self.assertEqual(self.items()[-1], said)
+            self.assertEqual((tolken.THINK, os.path.exists("settings.json")), ("high", False))
+
     async def test_changed_settings_take_effect_in_the_running_session(self):
         self.keep_settings()
         info = {"default_generation_settings": {"n_ctx": 8192}, "model_path": "demo.gguf"}

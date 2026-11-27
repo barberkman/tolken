@@ -13,6 +13,8 @@ Typing / suggests the commands: Up/Down choose, Enter runs one, Tab completes it
 /settings lists the settings with their values; Enter puts one's value in the input,
 where Enter saves it (in settings.json too) and Esc leaves it as it was. Its model
 row opens the list of models: the one chosen is switched to and started with from then on.
+/think says how much the model thinks; /think off, on, low, medium or high sets it from
+the next call on, until tolken exits (settings.json keeps its own).
 The model named in settings.json is switched to at startup; without one, the
 first listed (Ollama's come before llama-server's).
 After an answer the empty input offers a next message, dim, and Tab puts it in the
@@ -75,6 +77,7 @@ PLACEHOLDER = "Do you remember the Shire, Mr. Frodo? · @file pins code · / for
 COMMANDS = {  # what typing / offers, in this order
     "/model": "choose the model: llama-server's or one of Ollama's",
     "/settings": "view and change the settings",
+    "/think": "how much the model thinks: off, on, low, medium or high",
     "/resume": "take up an earlier session of this folder",
     "/undo": "put back the files that the last change of files changed",
     "/clear": "forget the loaded code and the conversation",
@@ -978,6 +981,8 @@ class TolkenApp(App):
                 self.run_model(lambda: self.find_model(wanted), "listing models")
             elif message == "/settings":
                 self.show_settings()
+            elif message.split()[:1] == ["/think"]:
+                self.add(tolken.set_think(message[6:].strip()))
             elif message == "/resume":
                 self.show_sessions()
             elif message:

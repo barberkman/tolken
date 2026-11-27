@@ -310,6 +310,10 @@ class Edits(InTempDir):
                   "FILE: b.py\n<<<<<<< SEARCH\ntwo\n=======\n2\n=======")
         self.assertEqual(tolken.parse_edits(answer), [("a.py", "one", "1"), ("b.py", "two", "2")])
 
+    def test_an_end_marker_before_the_divider_is_dropped(self):
+        answer = "FILE: a.py\n<<<<<<< SEARCH\none\n>>>>>>> REPLACE\n=======\n1\n>>>>>>> REPLACE\n"
+        self.assertEqual(tolken.parse_edits(answer), [("a.py", "one", "1")])
+
     def test_a_divider_line_in_the_new_text_is_kept_when_the_block_ends_with_its_marker(self):
         answer = "FILE: a.md\n<<<<<<< SEARCH\nTitle\n=======\nHeading\n=======\ntext\n>>>>>>> REPLACE\n"
         self.assertEqual(tolken.parse_edits(answer), [("a.md", "Title", "Heading\n=======\ntext")])
@@ -397,6 +401,28 @@ class Edits(InTempDir):
         with mock.patch("builtins.input", return_value="y"):
             tolken.edit_file("a.txt", [("one", "1"), ("1", "uno")])
         self.assertEqual(read_bytes("a.txt"), b"uno\ntwo\n")
+
+    def test_a_divider_line_of_the_file_is_part_of_the_old_lines(self):
+        write("a.h", "a\n};\n=======\nb\n};\nc\n")  # a ======= line got into the file, and }; matches two places
+        for path, old, new in tolken.parse_edits("FILE: a.h\n<<<<<<< SEARCH\n};\n=======\nb\n=======\n};\n"
+                                                 ">>>>>>> REPLACE\n"):
+            self.assertEqual(tolken.edit_file(path, [(old, new)], auto=True), (True, []))
+        self.assertEqual(read_bytes("a.h"), b"a\n};\n};\nc\n")
+
+    def test_the_last_divider_whose_old_lines_match_divides_the_block(self):
+        text = "Title\n=======\ntext\n"
+        self.assertEqual(tolken.reading(text, "Title", "text\n=======\nNew\n=======\ntext"),
+                         ("Title\n=======\ntext", "New\n=======\ntext"))
+        self.assertEqual(tolken.reading(text, "text", "Heading\n=======\nmore"), ("text", "Heading\n=======\nmore"))
+
+    def test_new_lines_given_twice_around_a_divider_are_written_once(self):
+        write("a.h", "one\ntwo\n")
+        for path, old, new in tolken.parse_edits("FILE: a.h\n<<<<<<< SEARCH\none\n=======\n1\nuno\n=======\n1\nuno\n"
+                                                 ">>>>>>> REPLACE\n"):
+            self.assertEqual(tolken.edit_file(path, [(old, new)], auto=True), (True, []))
+        self.assertEqual(read_bytes("a.h"), b"1\nuno\ntwo\n")
+        for new in ("=======", "\n=======\n"):  # nothing is given twice: the line is the new text
+            self.assertEqual(tolken.reading("Title\n-------\n", "-------", new), ("-------", new))
 
     def test_declined_or_unmatched_edit_leaves_file_alone(self):
         write("a.txt", "one\r\ntwo\r\n")
@@ -1209,9 +1235,20 @@ class Rounds(InTempDir):
     def test_going_on_without_changes_stops_after_one_more_call(self):
         self.assertEqual(len(self.run_main(["Plan first.\nCONTINUE", "Still planning.\nCONTINUE", "never"])), 2)
 
-    def test_asking_again_for_shown_code_stops(self):
+    def test_asking_again_for_shown_code_is_told_why_once_and_then_stops(self):
         write("a.py", "x\n")
-        self.assertEqual(len(self.run_main(["NEED: a.py", "NEED: a.py", "never"])), 2)
+        calls = self.run_main(["NEED: a.py"] * 3 + ["ok"], inputs=["zzz question", "zzz more"])
+        self.assertEqual(len(calls), 4)  # the third answer ends the first message
+        told = "What happened after your last answer:\n" + tolken.unmet("NEED: a.py", ["a.py"], [["a.py", 1, None]])[0]
+        self.assertTrue(told.endswith("is as the file is now: a.py"), told)
+        self.assertEqual(self.sent[2:], [told + "\n\nzzz question", told + "\n\nzzz more"])
+
+    def test_asking_for_a_file_that_is_not_there_is_told(self):
+        write("a.py", "x\n")
+        calls = self.run_main(["NEED: `missing.py`, a.py", "NEED: missing.py", "There is none."])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.sent[2], "What happened after your last answer:\n"
+                                       "there is no file to show for: missing.py\n\nzzz question")
 
     def test_the_call_that_fills_the_window_is_the_last(self):
         write("big.py", "\n".join(f"line{i}" for i in range(1, 1001)) + "\n")
@@ -1361,7 +1398,7 @@ class Models(InTempDir):
         self.assertEqual(after("It prints old.").suggestion, "")
         self.assertEqual(after("Plan first.\nCONTINUE", "Still planning.\nCONTINUE").suggestion, "continue")
         self.assertEqual(after(*[edit.format("no such line", "x")] * 2).suggestion, "try again")
-        self.assertEqual(after("NEED: missing.py").suggestion, "try again")
+        self.assertEqual(after("NEED: missing.py", "NEED: missing.py").suggestion, "try again")
         self.assertEqual(after(edit.format("old", "new") + "DONE").suggestion, "")  # git commit is not allowed
         session = after(edit.format("old", "new") + "DONE", run=["git commit", "git add"])
         self.assertEqual(session.suggestion, "commit the changes")
@@ -1802,6 +1839,11 @@ class Logs(InTempDir):
                               inputs=["zzz first", "/clear", "/resume 1", "zzz second"])
         self.assertIn("zzz first\n\nthe first answer", calls[1])
 
+    def test_think_is_a_command_of_the_plain_prompt(self):
+        with mock.patch.object(tolken, "THINK", False):
+            self.assertEqual(len(self.run_main(["an answer"], inputs=["/think high", "zzz question"])), 1)
+            self.assertEqual(tolken.THINK, "high")
+
     def test_an_edit_that_failed_is_logged_as_the_model_is_told_of_it(self):
         self.run_main(["FILE: a.py\n<<<<<<< SEARCH\nold\n>>>>>>> REPLACE\n", "DONE"])
         self.assertEqual(self.lines()[1], {"report": [
@@ -1930,6 +1972,17 @@ class Settings(InTempDir):
             os.remove("settings.json")
             tolken.save_setting("max_out", 8000)  # a file that is gone is written anew
             self.assertEqual(json.loads(read_bytes("settings.json")), {"max_out": 8000})
+
+    def test_think_is_set_for_the_run_and_not_saved(self):
+        with mock.patch.object(tolken, "SETTINGS", "settings.json"), mock.patch.object(tolken, "THINK", False):
+            self.assertEqual(tolken.set_think(""), "thinking: off")
+            for wanted, value in (("high", "high"), ("on", True), ("off", False), ("low", "low")):
+                self.assertEqual(tolken.set_think(wanted), f"thinking: {wanted}")
+                self.assertEqual(tolken.THINK, value)
+            self.assertEqual(tolken.set_think("lots"), "/think takes one of: off, on, low, medium, high")
+            self.assertEqual((tolken.set_think(""), tolken.THINK), ("thinking: low", "low"))
+            tolken.save_setting("max_out", 2000)  # another setting saved leaves it in use, and out of the file
+            self.assertEqual((tolken.THINK, json.loads(read_bytes("settings.json"))), ("low", {"max_out": 2000}))
 
     def test_a_session_takes_up_a_changed_setting(self):
         with mock.patch.object(tolken, "SETTINGS", "settings.json"):
